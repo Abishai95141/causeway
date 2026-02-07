@@ -13,6 +13,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
+# Configure root logger BEFORE any other imports
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s  %(name)s  %(message)s",
+)
+# Silence noisy loggers
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse

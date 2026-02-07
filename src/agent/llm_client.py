@@ -10,11 +10,14 @@ Wrapper for Google Gemini API with:
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional, Type, TypeVar
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 from pydantic import BaseModel
 
@@ -150,12 +153,28 @@ class LLMClient:
                 )
                 
             except Exception as e:
+                if self._is_daily_quota_error(e):
+                    logger.error("Gemini daily quota exhausted (free tier: 20 req/day). Cannot retry.")
+                    raise RuntimeError(
+                        "Gemini API daily quota exhausted (free tier: 20 requests/day). "
+                        "Wait until tomorrow or upgrade to a paid plan at https://ai.google.dev/pricing"
+                    ) from e
                 if attempt < self.max_retries - 1:
                     delay = self._get_retry_delay(e, attempt)
+                    logger.warning(
+                        "LLM call failed (attempt %d/%d): %s — retrying in %.0fs",
+                        attempt + 1, self.max_retries, str(e)[:120], delay,
+                    )
                     await asyncio.sleep(delay)
                 else:
                     raise
-    
+
+    @staticmethod
+    def _is_daily_quota_error(error: Exception) -> bool:
+        """Check if this is an unretryable daily quota exhaustion."""
+        err_str = str(error)
+        return 'FreeTier' in err_str or 'PerDay' in err_str or 'free_tier' in err_str
+
     @staticmethod
     def _get_retry_delay(error: Exception, attempt: int) -> float:
         """Extract retry delay from rate-limit errors, or use exponential backoff."""
@@ -291,8 +310,18 @@ Respond ONLY with the JSON, no other text."""
                 )
 
             except Exception as e:
+                if self._is_daily_quota_error(e):
+                    logger.error("Gemini daily quota exhausted (free tier: 20 req/day). Cannot retry.")
+                    raise RuntimeError(
+                        "Gemini API daily quota exhausted (free tier: 20 requests/day). "
+                        "Wait until tomorrow or upgrade to a paid plan at https://ai.google.dev/pricing"
+                    ) from e
                 if attempt < self.max_retries - 1:
                     delay = self._get_retry_delay(e, attempt)
+                    logger.warning(
+                        "LLM tool call failed (attempt %d/%d): %s — retrying in %.0fs",
+                        attempt + 1, self.max_retries, str(e)[:120], delay,
+                    )
                     await asyncio.sleep(delay)
                 else:
                     raise

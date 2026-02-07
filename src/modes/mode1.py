@@ -31,6 +31,8 @@ from src.models.enums import (
 )
 from src.protocol.state_machine import ProtocolState
 
+_logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AuditStep:
@@ -230,6 +232,7 @@ Respond with a JSON array of edges:
                 # Sanitize: lowercase, replace non-alphanum with _, collapse runs
                 var_id = _re.sub(r'[^a-z0-9]+', '_', var.name.lower()).strip('_')
                 if not var_id or var_id in added_var_ids:
+                    _logger.warning("Variable skipped (empty or dup): name=%r id=%r", var.name, var_id)
                     continue
                 try:
                     engine.add_variable(
@@ -240,26 +243,33 @@ Respond with a JSON array of edges:
                         measurement_status=var.measurement_status,
                     )
                     added_var_ids.add(var_id)
-                except Exception:
+                except Exception as _var_err:
+                    _logger.warning("Variable %r skipped: %s", var.name, _var_err)
                     continue
-            
+
+            _logger.info("Added %d variables to engine: %s", len(added_var_ids), sorted(added_var_ids))
+
             # Add edges
-            _logger = logging.getLogger(__name__)
+            edges_added = 0
             for edge in edges:
                 try:
                     # Sanitize edge variable references the same way
                     from_id = _re.sub(r'[^a-z0-9]+', '_', edge.from_var.lower()).strip('_')
                     to_id = _re.sub(r'[^a-z0-9]+', '_', edge.to_var.lower()).strip('_')
+                    _logger.info("Attempting edge: %s → %s (raw: %s → %s)",
+                                 from_id, to_id, edge.from_var, edge.to_var)
                     engine.add_edge(
                         from_var=from_id,
                         to_var=to_id,
                         mechanism=edge.mechanism,
                         strength=edge.strength,
                     )
+                    edges_added += 1
                 except Exception as _edge_err:
-                    # Log so we know why edges are being skipped
-                    _logger.warning("Edge %s→%s skipped: %s", edge.from_var, edge.to_var, _edge_err)
+                    _logger.warning("Edge %s→%s skipped: %s", from_id, to_id, _edge_err)
                     continue
+
+            _logger.info("Added %d/%d edges to engine", edges_added, len(edges))
             
             # Stage 5: Human Review
             self._current_stage = Mode1Stage.HUMAN_REVIEW
@@ -319,10 +329,13 @@ Respond with a JSON array of edges:
         )
         
         response = await self.llm.generate(prompt)
-        
+        _logger.info("Variable discovery: LLM returned %d chars", len(response.content))
+
         # Parse variables from response
         variables = self._parse_variables(response.content)
-        
+        _logger.info("Parsed %d variables: %s",
+                     len(variables), [v.name for v in variables])
+
         self._variable_candidates = variables[:max_variables]
         return self._variable_candidates
     
@@ -364,12 +377,14 @@ Respond with a JSON array of edges:
         )
         
         response = await self.llm.generate(prompt)
-        
+        _logger.info("DAG draft LLM response (%d chars): %.300s...",
+                     len(response.content), response.content)
+
         # Parse edges from response
-        _logger = logging.getLogger(__name__)
         edges = self._parse_edges(response.content)
-        _logger.info("DAG draft: parsed %d edges from LLM response (%d chars)",
-                     len(edges), len(response.content) if response.content else 0)
+        _logger.info("DAG draft: parsed %d edges from LLM response", len(edges))
+        for e in edges:
+            _logger.info("  Edge: %s → %s (%s)", e.from_var, e.to_var, e.mechanism[:60])
         
         self._edge_candidates = edges[:max_edges]
         return self._edge_candidates
@@ -409,6 +424,38 @@ Respond with a JSON array of edges:
                 return json.loads(content[start:end + 1])
             except json.JSONDecodeError:
                 pass
+
+        # Strategy 3: LLM sometimes omits the outer [ ].
+        # Wrap a fenced code block in [ ] and try again.
+        m2 = re.search(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
+        body = m2.group(1).strip() if m2 else content.strip()
+        if body and not body.startswith('['):
+            try:
+                return json.loads(f'[{body}]')
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 4: find all top-level { ... } objects via bracket matching
+        objects: list[dict] = []
+        depth = 0
+        obj_start = -1
+        for i, ch in enumerate(content):
+            if ch == '{':
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and obj_start != -1:
+                    try:
+                        obj = json.loads(content[obj_start:i + 1])
+                        if isinstance(obj, dict):
+                            objects.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    obj_start = -1
+        if objects:
+            return objects
 
         return []
 

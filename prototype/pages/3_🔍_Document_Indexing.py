@@ -86,49 +86,70 @@ query = st.text_input(
     help="Enter a question to search across indexed documents"
 )
 
-col1, col2 = st.columns([1, 4])
-with col1:
+col_opts1, col_opts2 = st.columns([1, 4])
+with col_opts1:
     top_k = st.number_input("Results", min_value=1, max_value=10, value=5)
+
+# Build list of known doc_ids for scoping
+all_doc_ids = []
+if 'indexed_docs' in st.session_state:
+    all_doc_ids = list(st.session_state.indexed_docs)
+if 'uploaded_docs' in st.session_state:
+    for d in st.session_state.uploaded_docs:
+        if d['doc_id'] not in all_doc_ids:
+            all_doc_ids.append(d['doc_id'])
+
+filter_options = ["All documents"] + all_doc_ids
+selected_filter = st.selectbox(
+    "🔎 Scope search to document",
+    filter_options,
+    help="Select a specific document to restrict results, or search all",
+)
+filter_doc_id = None if selected_filter == "All documents" else selected_filter
 
 if st.button("🔍 Search", key="search"):
     if query:
         with st.spinner("Searching..."):
             try:
-                # Direct call to retrieval router (mock mode)
-                import sys
-                sys.path.insert(0, '/home/abishai/Desktop/causeway')
-                
-                from src.retrieval.router import RetrievalRouter
-                import asyncio
-                
-                async def search():
-                    router = RetrievalRouter()
-                    await router.initialize()
-                    results = await router.retrieve_simple(query, max_results=top_k)
-                    return results
-                
-                results = asyncio.run(search())
-                
-                if results:
-                    st.success(f"✅ Found {len(results)} results")
-                    
-                    for i, result in enumerate(results):
-                        score = result.retrieval_trace.scores.get("vector", 0.0) if result.retrieval_trace.scores else 0.0
-                        with st.expander(f"Result {i+1}: Score {score:.3f}"):
-                            st.markdown(f"**Content:**")
-                            st.markdown(result.content[:500] + "..." if len(result.content) > 500 else result.content)
-                            st.markdown(f"**Source:** `{result.source.doc_id}` — *{result.source.doc_title}*")
-                            if result.location.page_number:
-                                st.markdown(f"**Page:** {result.location.page_number}")
-                            if result.location.section_name:
-                                st.markdown(f"**Section:** {result.location.section_name}")
-                            st.markdown(f"**Hash:** `{result.content_hash[:16]}...`")
+                payload = {
+                    "query": query,
+                    "max_results": top_k,
+                }
+                if filter_doc_id:
+                    payload["doc_id"] = filter_doc_id
+
+                resp = requests.post(
+                    "http://localhost:8000/api/v1/search",
+                    json=payload,
+                    timeout=15,
+                )
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    results = data.get("results", [])
+
+                    if results:
+                        st.success(f"✅ Found {len(results)} results")
+
+                        for i, r in enumerate(results):
+                            with st.expander(f"Result {i+1}: Score {r['score']:.3f}"):
+                                st.markdown("**Content:**")
+                                content_text = r['content']
+                                st.markdown(content_text[:500] + "..." if len(content_text) > 500 else content_text)
+                                st.markdown(f"**Source:** `{r['doc_id']}` — *{r['doc_title']}*")
+                                if r.get('page'):
+                                    st.markdown(f"**Page:** {r['page']}")
+                                if r.get('section'):
+                                    st.markdown(f"**Section:** {r['section']}")
+                    else:
+                        st.warning("No results found. Try indexing more documents or a different query.")
                 else:
-                    st.warning("No results found. Try indexing more documents.")
-                    
+                    st.error(f"❌ Search failed ({resp.status_code}): {resp.text[:300]}")
+
+            except requests.exceptions.ConnectionError:
+                st.error("❌ Cannot connect to API server. Is it running on port 8000?")
             except Exception as e:
                 st.error(f"❌ Error: {e}")
-                st.info("Make sure documents are indexed and services are running.")
     else:
         st.warning("Please enter a search query")
 

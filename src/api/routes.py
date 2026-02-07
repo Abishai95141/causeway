@@ -223,10 +223,21 @@ async def search_evidence(request: SearchRequest):
     """
     retrieval = await get_retrieval_router()
 
-    bundles = await retrieval.retrieve_simple(
-        query=request.query,
-        max_results=request.max_results,
-    )
+    if request.doc_id:
+        from src.retrieval.router import RetrievalRequest, RetrievalStrategy
+        bundles = await retrieval.retrieve(
+            RetrievalRequest(
+                query=request.query,
+                doc_ids=[request.doc_id],
+                strategy=RetrievalStrategy.HAYSTACK_ONLY,
+                max_results=request.max_results,
+            )
+        )
+    else:
+        bundles = await retrieval.retrieve_simple(
+            query=request.query,
+            max_results=request.max_results,
+        )
 
     results = [
         SearchResult(
