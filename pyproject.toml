@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causeway"
+version = "0.1.0"
+description = "Agentic Decision Support System with Causal World Models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Causeway Team"}
+]
+
+dependencies = [
+    # Core
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    
+    # API
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.6",
+    
+    # Database
+    "sqlalchemy[asyncio]>=2.0.25",
+    "asyncpg>=0.29.0",
+    "alembic>=1.13.0",
+    
+    # Cache
+    "redis>=5.0.0",
+    
+    # Object Storage
+    "minio>=7.2.0",
+    
+    # Haystack & Retrieval
+    "haystack-ai>=2.0.0",
+    "qdrant-haystack>=3.0.0",
+    "sentence-transformers>=2.2.0",
+    
+    # Causal Analysis
+    "networkx>=3.2.0",
+    # "pywhyllm>=0.1.0",  # Uncomment when available/needed
+    
+    # LLM
+    "google-generativeai>=0.4.0",
+    
+    # Document Processing
+    "pypdf>=3.17.0",
+    "openpyxl>=3.1.0",
+    "markdown>=3.5.0",
+    
+    # Utilities
+    "httpx>=0.26.0",
+    "tenacity>=8.2.0",
+    "python-dateutil>=2.8.0",
+    
+    # Observability
+    "opentelemetry-api>=1.22.0",
+    "opentelemetry-sdk>=1.22.0",
+    "prometheus-client>=0.19.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "httpx>=0.26.0",
+    "ruff>=0.1.0",
+    "mypy>=1.8.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

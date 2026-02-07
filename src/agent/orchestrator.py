@@ -1,0 +1,371 @@
+"""
+Agent Orchestrator
+
+High-level orchestrator for LLM-driven operations:
+- Tool dispatch
+- Multi-step reasoning
+- Error handling
+- Result formatting
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
+from uuid import uuid4
+
+from src.agent.llm_client import LLMClient, LLMResponse, ToolDefinition
+from src.agent.context_manager import ContextManager, MessageRole
+from src.retrieval.router import RetrievalRouter, RetrievalRequest
+from src.causal.service import CausalService
+
+
+@dataclass
+class ToolResult:
+    """Result of a tool execution."""
+    tool_name: str
+    success: bool
+    result: Any
+    error: Optional[str] = None
+    execution_time_ms: int = 0
+
+
+@dataclass
+class OrchestratorResult:
+    """Result of an orchestrator run."""
+    trace_id: str
+    query: str
+    response: str
+    tool_calls: list[ToolResult] = field(default_factory=list)
+    total_tokens: int = 0
+    latency_ms: int = 0
+    error: Optional[str] = None
+
+
+class AgentOrchestrator:
+    """
+    Orchestrates LLM interactions with tools.
+    
+    Features:
+    - Multi-step tool calling
+    - Evidence retrieval integration
+    - Causal reasoning integration
+    - Error handling and recovery
+    """
+    
+    def __init__(
+        self,
+        llm_client: Optional[LLMClient] = None,
+        retrieval_router: Optional[RetrievalRouter] = None,
+        causal_service: Optional[CausalService] = None,
+        max_tool_calls: int = 5,
+    ):
+        self.llm = llm_client or LLMClient()
+        self.retrieval = retrieval_router or RetrievalRouter()
+        self.causal = causal_service or CausalService()
+        self.max_tool_calls = max_tool_calls
+        
+        self._context = ContextManager()
+        self._tools = self._register_default_tools()
+        self._tool_handlers: dict[str, Callable] = {}
+        
+        self._setup_tool_handlers()
+    
+    async def initialize(self) -> None:
+        """Initialize all components."""
+        await self.llm.initialize()
+        await self.retrieval.initialize()
+    
+    async def run(
+        self,
+        query: str,
+        system_prompt: Optional[str] = None,
+    ) -> OrchestratorResult:
+        """
+        Run the orchestrator with a query.
+        
+        Args:
+            query: User query
+            system_prompt: Optional system instructions
+            
+        Returns:
+            OrchestratorResult with response and tool calls
+        """
+        trace_id = f"orch_{uuid4().hex[:12]}"
+        start_time = datetime.now(timezone.utc)
+        
+        # Set up context
+        self._context.clear()
+        if system_prompt:
+            self._context.set_system_prompt(system_prompt)
+        self._context.add_user_message(query)
+        
+        tool_results = []
+        total_tokens = 0
+        current_response = ""
+        
+        try:
+            for iteration in range(self.max_tool_calls + 1):
+                # Get LLM response
+                response = await self.llm.generate_with_tools(
+                    prompt=self._context.build_prompt(),
+                    tools=self._tools,
+                    system_prompt=system_prompt,
+                )
+                
+                total_tokens += response.total_tokens
+                current_response = response.content
+                
+                # Check for tool calls
+                if response.tool_calls and iteration < self.max_tool_calls:
+                    for tool_call in response.tool_calls:
+                        result = await self._execute_tool(
+                            tool_call.get("tool", ""),
+                            tool_call.get("arguments", {}),
+                        )
+                        tool_results.append(result)
+                        
+                        # Add tool result to context
+                        self._context.add_assistant_message(
+                            f"Calling tool: {result.tool_name}"
+                        )
+                        self._context.add_tool_result(
+                            result.tool_name,
+                            str(result.result) if result.success else f"Error: {result.error}",
+                        )
+                else:
+                    # No more tool calls, we have the final response
+                    break
+            
+            latency = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+            
+            return OrchestratorResult(
+                trace_id=trace_id,
+                query=query,
+                response=current_response,
+                tool_calls=tool_results,
+                total_tokens=total_tokens,
+                latency_ms=latency,
+            )
+            
+        except Exception as e:
+            latency = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+            return OrchestratorResult(
+                trace_id=trace_id,
+                query=query,
+                response="",
+                tool_calls=tool_results,
+                total_tokens=total_tokens,
+                latency_ms=latency,
+                error=str(e),
+            )
+    
+    async def _execute_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        """Execute a tool by name."""
+        start_time = datetime.now(timezone.utc)
+        
+        handler = self._tool_handlers.get(tool_name)
+        if not handler:
+            return ToolResult(
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=f"Unknown tool: {tool_name}",
+            )
+        
+        try:
+            result = await handler(**arguments)
+            execution_time = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+            return ToolResult(
+                tool_name=tool_name,
+                success=True,
+                result=result,
+                execution_time_ms=execution_time,
+            )
+        except Exception as e:
+            execution_time = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+            return ToolResult(
+                tool_name=tool_name,
+                success=False,
+                result=None,
+                error=str(e),
+                execution_time_ms=execution_time,
+            )
+    
+    def _register_default_tools(self) -> list[ToolDefinition]:
+        """Register default available tools."""
+        return [
+            ToolDefinition(
+                name="search_evidence",
+                description="Search for relevant evidence from documents",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results (default 5)",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            ToolDefinition(
+                name="analyze_causal_path",
+                description="Analyze causal relationship between two variables",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "cause": {
+                            "type": "string",
+                            "description": "The cause variable",
+                        },
+                        "effect": {
+                            "type": "string",
+                            "description": "The effect variable",
+                        },
+                        "domain": {
+                            "type": "string",
+                            "description": "Domain of the world model",
+                        },
+                    },
+                    "required": ["cause", "effect"],
+                },
+            ),
+            ToolDefinition(
+                name="get_model_summary",
+                description="Get summary of a causal world model",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "domain": {
+                            "type": "string",
+                            "description": "Domain of the world model",
+                        },
+                    },
+                    "required": ["domain"],
+                },
+            ),
+            ToolDefinition(
+                name="find_confounders",
+                description="Find confounding variables between cause and effect",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "cause": {
+                            "type": "string",
+                            "description": "The cause variable",
+                        },
+                        "effect": {
+                            "type": "string",
+                            "description": "The effect variable",
+                        },
+                    },
+                    "required": ["cause", "effect"],
+                },
+            ),
+        ]
+    
+    def _setup_tool_handlers(self) -> None:
+        """Set up tool execution handlers."""
+        self._tool_handlers = {
+            "search_evidence": self._handle_search_evidence,
+            "analyze_causal_path": self._handle_analyze_causal_path,
+            "get_model_summary": self._handle_get_model_summary,
+            "find_confounders": self._handle_find_confounders,
+        }
+    
+    async def _handle_search_evidence(
+        self,
+        query: str,
+        max_results: int = 5,
+    ) -> dict[str, Any]:
+        """Handle evidence search tool call."""
+        bundles = await self.retrieval.retrieve_simple(query, max_results)
+        
+        results = []
+        for bundle in bundles:
+            results.append({
+                "content": bundle.content[:500],  # Truncate for context
+                "source": bundle.source.doc_title,
+                "location": {
+                    "page": bundle.location.page_number,
+                    "section": bundle.location.section_name,
+                },
+            })
+            
+            # Track evidence in context
+            self._context.add_evidence(
+                bundle.content_hash[:8],
+                bundle.content[:100] + "...",
+            )
+        
+        return {"results": results, "count": len(results)}
+    
+    async def _handle_analyze_causal_path(
+        self,
+        cause: str,
+        effect: str,
+        domain: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Handle causal path analysis tool call."""
+        try:
+            analysis = self.causal.analyze_relationship(cause, effect, domain)
+            return {
+                "cause": analysis.cause,
+                "effect": analysis.effect,
+                "direct_effect": analysis.direct_effect,
+                "total_paths": analysis.total_paths,
+                "confounders": analysis.confounders,
+                "mediators": analysis.mediators,
+                "paths": [{"path": p.path, "length": p.length} for p in analysis.paths[:5]],
+            }
+        except ValueError as e:
+            return {"error": str(e)}
+    
+    async def _handle_get_model_summary(
+        self,
+        domain: str,
+    ) -> dict[str, Any]:
+        """Handle model summary tool call."""
+        try:
+            return self.causal.get_model_summary(domain)
+        except ValueError as e:
+            return {"error": str(e)}
+    
+    async def _handle_find_confounders(
+        self,
+        cause: str,
+        effect: str,
+    ) -> dict[str, Any]:
+        """Handle confounder finding tool call."""
+        try:
+            confounders = self.causal.identify_confounders(cause, effect)
+            return {
+                "cause": cause,
+                "effect": effect,
+                "confounders": confounders,
+                "count": len(confounders),
+            }
+        except ValueError as e:
+            return {"error": str(e)}
+    
+    def register_tool(
+        self,
+        definition: ToolDefinition,
+        handler: Callable,
+    ) -> None:
+        """Register a custom tool."""
+        self._tools.append(definition)
+        self._tool_handlers[definition.name] = handler
+    
+    @property
+    def context(self) -> ContextManager:
+        """Get the context manager."""
+        return self._context
