@@ -151,17 +151,27 @@ class RetrievalRouter:
         request: RetrievalRequest,
     ) -> list[EvidenceBundle]:
         """Retrieve from Haystack only."""
-        doc_id = request.doc_ids[0] if request.doc_ids else None
-        doc_title = None
-        if doc_id and request.doc_titles:
-            doc_title = request.doc_titles.get(doc_id)
-        
-        return await self.haystack.retrieve_evidence(
-            query=request.query,
-            doc_id=doc_id,
-            doc_title=doc_title,
-            top_k=request.max_results,
-        )
+        all_bundles: list[EvidenceBundle] = []
+
+        if request.doc_ids:
+            # Query per doc_id so we don't lose any
+            per_doc = max(1, request.max_results // len(request.doc_ids))
+            for doc_id in request.doc_ids:
+                doc_title = (request.doc_titles or {}).get(doc_id, doc_id)
+                bundles = await self.haystack.retrieve_evidence(
+                    query=request.query,
+                    doc_id=doc_id,
+                    doc_title=doc_title,
+                    top_k=per_doc,
+                )
+                all_bundles.extend(bundles)
+        else:
+            all_bundles = await self.haystack.retrieve_evidence(
+                query=request.query,
+                top_k=request.max_results,
+            )
+
+        return all_bundles[:request.max_results]
     
     async def _retrieve_both(
         self,
@@ -238,6 +248,17 @@ class RetrievalRouter:
         Returns:
             Dict with pageindex_doc_id and haystack_chunk_ids
         """
+        from src.extraction.extractor import DocumentExtractor
+
+        extractor = DocumentExtractor()
+        text_content = extractor.extract(content, content_type, filename)
+
+        if not text_content.strip():
+            raise ValueError(
+                f"Text extraction produced no content for {filename} "
+                f"(content_type={content_type}, {len(content)} bytes)"
+            )
+
         # Register with PageIndex
         pi_doc_id = await self.register_document_pageindex(
             doc_id=doc_id,
@@ -246,8 +267,7 @@ class RetrievalRouter:
             content_type=content_type,
         )
         
-        # Index with Haystack
-        text_content = content.decode("utf-8", errors="ignore")
+        # Index with Haystack (always text from here on)
         hs_chunk_ids = await self.index_document_haystack(
             doc_id=doc_id,
             content=text_content,

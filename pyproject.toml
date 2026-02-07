@@ -41,7 +41,7 @@ dependencies = [
     
     # Causal Analysis
     "networkx>=3.2.0",
-    # "pywhyllm>=0.1.0",  # Uncomment when available/needed
+    "pywhyllm>=0.1.0",
     
     # LLM
     "google-generativeai>=0.4.0",

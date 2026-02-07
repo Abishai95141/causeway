@@ -66,7 +66,7 @@ class ObjectStore:
         except S3Error as e:
             raise RuntimeError(f"Failed to create bucket: {e}") from e
     
-    def _generate_object_name(self, doc_id: UUID, filename: str) -> str:
+    def _generate_object_name(self, doc_id: str, filename: str) -> str:
         """Generate object name from doc_id and filename."""
         # Use doc_id prefix for organization, preserve original extension
         ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
@@ -78,7 +78,7 @@ class ObjectStore:
     
     def upload_file(
         self,
-        doc_id: UUID,
+        doc_id: str,
         filename: str,
         data: BinaryIO,
         content_type: str,
@@ -116,7 +116,7 @@ class ObjectStore:
     
     def upload_bytes(
         self,
-        doc_id: UUID,
+        doc_id: str,
         filename: str,
         content: bytes,
         content_type: str,
@@ -165,14 +165,16 @@ class ObjectStore:
         
         bucket_name, object_name = parts
         
+        response = None
         try:
             response = client.get_object(bucket_name, object_name)
             return response.read()
         except S3Error as e:
             raise RuntimeError(f"Failed to download file: {e}") from e
         finally:
-            response.close()
-            response.release_conn()
+            if response is not None:
+                response.close()
+                response.release_conn()
     
     def download_to_file(self, storage_uri: str, file_path: str) -> None:
         """

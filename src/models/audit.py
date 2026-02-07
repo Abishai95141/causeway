@@ -1,6 +1,6 @@
 """Audit log entry model for full traceability."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
@@ -18,7 +18,7 @@ class AuditEntry(BaseModel):
     """
     
     audit_id: UUID = Field(default_factory=uuid4)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     mode: OperatingMode = Field(..., description="Which mode was executed")
     trace_id: str = Field(
         ...,

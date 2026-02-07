@@ -1,6 +1,6 @@
 """Decision query and recommendation models for Mode 2."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -32,7 +32,7 @@ class DecisionQuery(BaseModel):
         default_factory=dict,
         description="Additional context (timeframe, proposed changes, etc.)"
     )
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     model_config = {
         "json_schema_extra": {
@@ -130,4 +130,4 @@ class EscalationResponse(BaseModel):
         default_factory=list,
         description="Model conflicts that triggered escalation"
     )
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

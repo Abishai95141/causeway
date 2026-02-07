@@ -22,22 +22,7 @@ from enum import Enum
 from typing import Any, AsyncGenerator, Callable, Optional
 from uuid import UUID, uuid4
 
-from src.models.enums import OperatingMode
-
-
-class ProtocolState(str, Enum):
-    """Protocol engine states."""
-    IDLE = "idle"
-    ROUTING = "routing"
-    # Mode 1 states
-    WM_DISCOVERY_RUNNING = "wm_discovery_running"
-    WM_REVIEW_PENDING = "wm_review_pending"
-    WM_ACTIVE = "wm_active"
-    # Mode 2 states
-    DECISION_SUPPORT_RUNNING = "decision_support_running"
-    RESPONSE_READY = "response_ready"
-    # Error state
-    ERROR = "error"
+from src.models.enums import OperatingMode, ProtocolState
 
 
 # Valid state transitions

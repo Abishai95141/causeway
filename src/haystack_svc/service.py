@@ -108,6 +108,9 @@ class HaystackService:
         """Convert Haystack chunk to canonical EvidenceBundle."""
         metadata = chunk.metadata
         
+        page_number = metadata.get("page_number")
+        section_name = metadata.get("section_name")
+
         return EvidenceBundle(
             content=chunk.content,
             source=SourceReference(
@@ -116,6 +119,8 @@ class HaystackService:
             ),
             location=LocationMetadata(
                 chunk_id=chunk.chunk_id,
+                page_number=int(page_number) if page_number is not None else None,
+                section_name=section_name,
             ),
             retrieval_trace=RetrievalTrace(
                 method=RetrievalMethod.HAYSTACK,

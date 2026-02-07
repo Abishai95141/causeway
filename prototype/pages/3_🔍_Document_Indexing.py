@@ -113,10 +113,15 @@ if st.button("🔍 Search", key="search"):
                     st.success(f"✅ Found {len(results)} results")
                     
                     for i, result in enumerate(results):
-                        with st.expander(f"Result {i+1}: Score {result.relevance_score:.3f}"):
+                        score = result.retrieval_trace.scores.get("vector", 0.0) if result.retrieval_trace.scores else 0.0
+                        with st.expander(f"Result {i+1}: Score {score:.3f}"):
                             st.markdown(f"**Content:**")
                             st.markdown(result.content[:500] + "..." if len(result.content) > 500 else result.content)
-                            st.markdown(f"**Source:** `{result.source_doc_id}`")
+                            st.markdown(f"**Source:** `{result.source.doc_id}` — *{result.source.doc_title}*")
+                            if result.location.page_number:
+                                st.markdown(f"**Page:** {result.location.page_number}")
+                            if result.location.section_name:
+                                st.markdown(f"**Section:** {result.location.section_name}")
                             st.markdown(f"**Hash:** `{result.content_hash[:16]}...`")
                 else:
                     st.warning("No results found. Try indexing more documents.")

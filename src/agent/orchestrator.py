@@ -17,6 +17,7 @@ from src.agent.llm_client import LLMClient, LLMResponse, ToolDefinition
 from src.agent.context_manager import ContextManager, MessageRole
 from src.retrieval.router import RetrievalRouter, RetrievalRequest
 from src.causal.service import CausalService
+from src.training.spans import SpanCollector, SpanStatus
 
 
 @dataclass
@@ -57,11 +58,13 @@ class AgentOrchestrator:
         llm_client: Optional[LLMClient] = None,
         retrieval_router: Optional[RetrievalRouter] = None,
         causal_service: Optional[CausalService] = None,
+        span_collector: Optional[SpanCollector] = None,
         max_tool_calls: int = 5,
     ):
         self.llm = llm_client or LLMClient()
         self.retrieval = retrieval_router or RetrievalRouter()
         self.causal = causal_service or CausalService()
+        self.spans = span_collector or SpanCollector(enabled=True)
         self.max_tool_calls = max_tool_calls
         
         self._context = ContextManager()
@@ -82,16 +85,15 @@ class AgentOrchestrator:
     ) -> OrchestratorResult:
         """
         Run the orchestrator with a query.
-        
-        Args:
-            query: User query
-            system_prompt: Optional system instructions
-            
-        Returns:
-            OrchestratorResult with response and tool calls
+        Instruments every LLM call and tool execution as spans.
         """
         trace_id = f"orch_{uuid4().hex[:12]}"
         start_time = datetime.now(timezone.utc)
+        
+        # Start a trace for this run
+        span_trace_id = self.spans.start_trace(name="orchestrator.run")
+        root_span = self.spans._span_stack[-1] if self.spans._span_stack else ""
+        self.spans.add_event(root_span, "query_received", {"query": query[:200]})
         
         # Set up context
         self._context.clear()
@@ -105,13 +107,24 @@ class AgentOrchestrator:
         
         try:
             for iteration in range(self.max_tool_calls + 1):
-                # Get LLM response
+                # Span: LLM call
+                llm_span = self.spans.start_span(
+                    "llm.generate",
+                    trace_id=span_trace_id,
+                    attributes={"iteration": iteration},
+                )
+
                 response = await self.llm.generate_with_tools(
                     prompt=self._context.build_prompt(),
                     tools=self._tools,
                     system_prompt=system_prompt,
                 )
-                
+
+                self.spans.end_span(llm_span, SpanStatus.COMPLETED, {
+                    "tokens": response.total_tokens,
+                    "has_tool_calls": bool(response.tool_calls),
+                })
+
                 total_tokens += response.total_tokens
                 current_response = response.content
                 
@@ -121,6 +134,7 @@ class AgentOrchestrator:
                         result = await self._execute_tool(
                             tool_call.get("tool", ""),
                             tool_call.get("arguments", {}),
+                            trace_id=span_trace_id,
                         )
                         tool_results.append(result)
                         
@@ -137,7 +151,13 @@ class AgentOrchestrator:
                     break
             
             latency = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
-            
+
+            self.spans.end_span(root_span, SpanStatus.COMPLETED, {
+                "total_tokens": total_tokens,
+                "tool_calls": len(tool_results),
+                "latency_ms": latency,
+            })
+
             return OrchestratorResult(
                 trace_id=trace_id,
                 query=query,
@@ -149,6 +169,7 @@ class AgentOrchestrator:
             
         except Exception as e:
             latency = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+            self.spans.end_span(root_span, SpanStatus.FAILED, {"error": str(e)})
             return OrchestratorResult(
                 trace_id=trace_id,
                 query=query,
@@ -163,12 +184,21 @@ class AgentOrchestrator:
         self,
         tool_name: str,
         arguments: dict[str, Any],
+        trace_id: Optional[str] = None,
     ) -> ToolResult:
-        """Execute a tool by name."""
+        """Execute a tool by name, recording a span."""
         start_time = datetime.now(timezone.utc)
-        
+
+        # Create a span for this tool execution
+        tool_span = self.spans.start_span(
+            f"tool.{tool_name}",
+            trace_id=trace_id,
+            attributes={"tool": tool_name, "arguments": str(arguments)[:200]},
+        )
+
         handler = self._tool_handlers.get(tool_name)
         if not handler:
+            self.spans.end_span(tool_span, SpanStatus.FAILED, {"error": "unknown_tool"})
             return ToolResult(
                 tool_name=tool_name,
                 success=False,
@@ -179,6 +209,9 @@ class AgentOrchestrator:
         try:
             result = await handler(**arguments)
             execution_time = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+            self.spans.end_span(tool_span, SpanStatus.COMPLETED, {
+                "execution_time_ms": execution_time,
+            })
             return ToolResult(
                 tool_name=tool_name,
                 success=True,
@@ -187,6 +220,7 @@ class AgentOrchestrator:
             )
         except Exception as e:
             execution_time = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+            self.spans.end_span(tool_span, SpanStatus.FAILED, {"error": str(e)})
             return ToolResult(
                 tool_name=tool_name,
                 success=False,

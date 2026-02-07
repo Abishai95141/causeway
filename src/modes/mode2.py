@@ -275,7 +275,7 @@ Provide your recommendation as JSON:
         """Refresh evidence for the query."""
         # Search for evidence about the intervention and outcome
         query = f"{parsed.intervention} effect on {parsed.target_outcome}"
-        evidence = await self.retrieval.retrieve_simple(query, top_k=5)
+        evidence = await self.retrieval.retrieve_simple(query, max_results=5)
         
         # Cache evidence
         for e in evidence:

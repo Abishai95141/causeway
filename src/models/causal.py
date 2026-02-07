@@ -1,6 +1,6 @@
 """Causal models for world model construction and DAG representation."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
@@ -129,7 +129,7 @@ class WorldModelVersion(BaseModel):
         default_factory=dict,
         description="NetworkX JSON representation of the graph"
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: str = Field(default="system", description="Creator identifier")
     approved_by: Optional[str] = Field(default=None, description="Approver for review gate")
     approved_at: Optional[datetime] = Field(default=None)

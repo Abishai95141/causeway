@@ -26,8 +26,8 @@ T = TypeVar("T", bound=BaseModel)
 
 class LLMModel(str, Enum):
     """Available LLM models."""
-    GEMINI_FLASH = "gemini-3-flash-preview"
-    GEMINI_PRO = "gemini-1.5-pro"
+    GEMINI_FLASH = "gemini-2.5-flash"
+    GEMINI_PRO = "gemini-2.5-pro"
 
 
 @dataclass
@@ -66,7 +66,7 @@ class LLMClient:
         self,
         api_key: Optional[str] = None,
         model: LLMModel = LLMModel.GEMINI_FLASH,
-        max_retries: int = 3,
+        max_retries: int = 5,
         timeout: float = 60.0,
     ):
         settings = get_settings()
@@ -87,9 +87,9 @@ class LLMClient:
             return
         
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self._client = genai.GenerativeModel(self.model.value)
+            from google import genai
+            self._genai_client = genai.Client(api_key=self.api_key)
+            self._client = self._genai_client
         except ImportError:
             self._mock_mode = True
     
@@ -121,34 +121,54 @@ class LLMClient:
         if system_prompt:
             full_prompt = f"{system_prompt}\n\n{prompt}"
         
+        from google.genai import types as genai_types
+
+        config = genai_types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+
         for attempt in range(self.max_retries):
             try:
                 response = await asyncio.to_thread(
-                    self._client.generate_content,
-                    full_prompt,
-                    generation_config={
-                        "temperature": temperature,
-                        "max_output_tokens": max_tokens,
-                    },
+                    self._client.models.generate_content,
+                    model=self.model.value,
+                    contents=full_prompt,
+                    config=config,
                 )
                 
                 latency = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
                 
+                usage = response.usage_metadata
                 return LLMResponse(
                     content=response.text,
                     model=self.model.value,
-                    prompt_tokens=response.usage_metadata.prompt_token_count if hasattr(response, 'usage_metadata') else 0,
-                    completion_tokens=response.usage_metadata.candidates_token_count if hasattr(response, 'usage_metadata') else 0,
-                    total_tokens=response.usage_metadata.total_token_count if hasattr(response, 'usage_metadata') else 0,
+                    prompt_tokens=usage.prompt_token_count if usage else 0,
+                    completion_tokens=usage.candidates_token_count if usage else 0,
+                    total_tokens=usage.total_token_count if usage else 0,
                     latency_ms=int(latency),
                 )
                 
             except Exception as e:
                 if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    delay = self._get_retry_delay(e, attempt)
+                    await asyncio.sleep(delay)
                 else:
                     raise
     
+    @staticmethod
+    def _get_retry_delay(error: Exception, attempt: int) -> float:
+        """Extract retry delay from rate-limit errors, or use exponential backoff."""
+        import re as _re
+        err_str = str(error)
+        if '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str:
+            # Try to parse the suggested retry delay
+            match = _re.search(r'retryDelay.*?(\d+)', err_str)
+            if match:
+                return float(match.group(1)) + 2  # Add buffer
+            return 30.0  # Default 30s for rate limits
+        return 2 ** attempt  # Normal exponential backoff
+
     async def generate_structured(
         self,
         prompt: str,
@@ -194,44 +214,131 @@ Respond ONLY with the JSON, no other text."""
         system_prompt: Optional[str] = None,
     ) -> LLMResponse:
         """
-        Generate with function calling capabilities.
-        
-        Args:
-            prompt: User prompt
-            tools: List of tool definitions
-            system_prompt: Optional system instructions
-            
-        Returns:
-            LLMResponse with possible tool_calls
+        Generate with native Gemini function calling.
+
+        Converts ToolDefinition list into google.generativeai
+        FunctionDeclaration objects so Gemini returns structured
+        tool_calls natively (no regex parsing needed).
+
+        Falls back to prompt-injected approach in mock mode.
         """
-        # Format tools for prompt
-        tools_descriptions = []
+        start_time = datetime.now(timezone.utc)
+
+        if self._mock_mode:
+            response = self._generate_mock_response(prompt)
+            response.tool_calls = self._extract_tool_calls(response.content)
+            return response
+
+        from google.genai import types as genai_types
+
+        # Build native FunctionDeclaration objects
+        fn_declarations = []
         for tool in tools:
-            tools_descriptions.append(
-                f"- {tool.name}: {tool.description}\n"
-                f"  Parameters: {json.dumps(tool.parameters)}"
+            fn_declarations.append(
+                genai_types.FunctionDeclaration(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=self._jsonschema_to_gemini(tool.parameters),
+                )
             )
-        
-        tools_prompt = f"""{prompt}
 
-Available tools:
-{chr(10).join(tools_descriptions)}
+        tool_config = genai_types.Tool(function_declarations=fn_declarations)
 
-If you need to call a tool, respond with a JSON object like:
-{{"tool": "tool_name", "arguments": {{...}}}}
+        full_prompt = prompt
+        if system_prompt:
+            full_prompt = f"{system_prompt}\n\n{prompt}"
 
-If you don't need to call a tool, just respond normally."""
-
-        response = await self.generate(
-            prompt=tools_prompt,
-            system_prompt=system_prompt,
+        config = genai_types.GenerateContentConfig(
+            temperature=0.7,
+            max_output_tokens=4096,
+            tools=[tool_config],
         )
-        
-        # Try to parse tool calls from response
-        tool_calls = self._extract_tool_calls(response.content)
-        response.tool_calls = tool_calls
-        
-        return response
+
+        for attempt in range(self.max_retries):
+            try:
+                response = await asyncio.to_thread(
+                    self._client.models.generate_content,
+                    model=self.model.value,
+                    contents=full_prompt,
+                    config=config,
+                )
+
+                latency = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+
+                # Extract tool calls from the native response
+                tool_calls: list[dict[str, Any]] = []
+                text_content = ""
+
+                for part in (response.candidates[0].content.parts if response.candidates else []):
+                    if part.function_call and part.function_call.name:
+                        fc = part.function_call
+                        tool_calls.append({
+                            "tool": fc.name,
+                            "arguments": dict(fc.args) if fc.args else {},
+                        })
+                    elif part.text:
+                        text_content += part.text
+
+                usage = response.usage_metadata
+                return LLMResponse(
+                    content=text_content,
+                    model=self.model.value,
+                    prompt_tokens=usage.prompt_token_count if usage else 0,
+                    completion_tokens=usage.candidates_token_count if usage else 0,
+                    total_tokens=usage.total_token_count if usage else 0,
+                    tool_calls=tool_calls,
+                    latency_ms=int(latency),
+                )
+
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    delay = self._get_retry_delay(e, attempt)
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+
+    @staticmethod
+    def _jsonschema_to_gemini(schema: dict[str, Any]) -> dict[str, Any]:
+        """
+        Convert a JSON Schema dict to the subset accepted by
+        ``google.generativeai.protos.Schema``.
+
+        Gemini expects ``type_`` (as enum string) and ``properties``
+        but does *not* accept ``additionalProperties``, ``$defs``, etc.
+        """
+        TYPE_MAP = {
+            "string": "STRING",
+            "integer": "INTEGER",
+            "number": "NUMBER",
+            "boolean": "BOOLEAN",
+            "array": "ARRAY",
+            "object": "OBJECT",
+        }
+
+        def _convert(node: dict[str, Any]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            json_type = node.get("type", "string")
+            result["type_"] = TYPE_MAP.get(json_type, "STRING")
+
+            if "description" in node:
+                result["description"] = node["description"]
+
+            if json_type == "object" and "properties" in node:
+                result["properties"] = {
+                    k: _convert(v) for k, v in node["properties"].items()
+                }
+                if "required" in node:
+                    result["required"] = node["required"]
+
+            if json_type == "array" and "items" in node:
+                result["items"] = _convert(node["items"])
+
+            if "enum" in node:
+                result["enum"] = node["enum"]
+
+            return result
+
+        return _convert(schema)
     
     def _extract_json(self, text: str) -> dict[str, Any]:
         """Extract JSON from text that may contain markdown or other content."""

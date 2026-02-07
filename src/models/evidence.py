@@ -1,7 +1,7 @@
 """Evidence models for retrieval results and provenance tracking."""
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -35,7 +35,7 @@ class RetrievalTrace(BaseModel):
     """Provenance information for how evidence was retrieved."""
     
     method: RetrievalMethod = Field(..., description="Retrieval method used")
-    timestamp: datetime = Field(default_factory=datetime.utcnow, description="When retrieved")
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="When retrieved")
     query: str = Field(..., description="Query string used for retrieval")
     scores: Optional[dict[str, float]] = Field(
         default=None,
@@ -63,7 +63,7 @@ class EvidenceBundle(BaseModel):
         description="Location within source document"
     )
     retrieval_trace: RetrievalTrace = Field(..., description="How this evidence was found")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     used_in_models: list[str] = Field(
         default_factory=list,
         description="World model version IDs that reference this evidence"

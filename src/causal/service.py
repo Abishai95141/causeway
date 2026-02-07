@@ -3,15 +3,21 @@ Causal Service
 
 High-level service for causal world model operations.
 Combines DAG engine and path finder for complete causal analysis.
+
+World models are cached in memory and persisted to PostgreSQL
+via DatabaseService so state survives restarts.
 """
 
+import logging
 from typing import Any, Optional
 from uuid import UUID
 
 from src.causal.dag_engine import DAGEngine, DAGValidationResult, CycleDetectedError
 from src.causal.path_finder import CausalPathFinder, CausalAnalysis
-from src.models.causal import WorldModelVersion, VariableDefinition, CausalEdge
+from src.models.causal import WorldModelVersion, VariableDefinition, CausalEdge, EdgeMetadata
 from src.models.enums import EvidenceStrength, ModelStatus, VariableType, MeasurementStatus
+
+logger = logging.getLogger(__name__)
 
 
 class CausalService:
@@ -23,10 +29,11 @@ class CausalService:
     - Variable and edge operations
     - Causal reasoning (paths, confounders, mediators)
     - Evidence linking
+    - PostgreSQL persistence (save / load)
     """
     
     def __init__(self):
-        self._engines: dict[str, DAGEngine] = {}  # domain -> engine
+        self._engines: dict[str, DAGEngine] = {}  # domain -> engine (in-memory cache)
         self._active_domain: Optional[str] = None
     
     def create_world_model(self, domain: str) -> DAGEngine:
@@ -219,3 +226,134 @@ class CausalService:
             "variables": [v.variable_id for v in engine.variables],
             "edges": [f"{e.from_var} → {e.to_var}" for e in engine.edges],
         }
+
+    # ------------------------------------------------------------------ #
+    # PostgreSQL persistence
+    # ------------------------------------------------------------------ #
+
+    async def save_to_db(self, domain: Optional[str] = None, version_id: Optional[str] = None) -> str:
+        """
+        Persist the current in-memory world model to PostgreSQL.
+
+        Returns:
+            The version_id of the saved record.
+        """
+        from src.storage.database import get_db_session, DatabaseService
+
+        target_domain = domain or self._active_domain
+        if not target_domain:
+            raise ValueError("No domain specified and no active domain set")
+
+        model = self.export_world_model(domain=target_domain, version_id=version_id)
+
+        # Serialise variables and edges to JSON-safe dicts
+        variables_json = {
+            vid: {
+                "name": v.name,
+                "definition": v.definition,
+                "variable_type": v.type.value if v.type else None,
+                "measurement_status": v.measurement_status.value if v.measurement_status else None,
+                "unit": v.unit,
+            }
+            for vid, v in model.variables.items()
+        }
+        edges_json = [
+            {
+                "from_var": e.from_var,
+                "to_var": e.to_var,
+                "mechanism": e.metadata.mechanism,
+                "strength": e.metadata.evidence_strength.value if e.metadata.evidence_strength else None,
+                "evidence_refs": [str(r) for r in (e.metadata.evidence_refs or [])],
+            }
+            for e in model.edges
+        ]
+
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            existing = await db.get_world_model(model.version_id)
+            if existing:
+                existing.variables = variables_json
+                existing.edges = edges_json
+                existing.dag_json = {"domain": target_domain}
+                await session.flush()
+                saved_id = existing.version_id
+            else:
+                wm = await db.create_world_model(
+                    version_id=model.version_id,
+                    domain=target_domain,
+                    description=f"World model for {target_domain}",
+                    variables=variables_json,
+                    edges=edges_json,
+                    dag_json={"domain": target_domain},
+                    status=model.status.value if model.status else "draft",
+                )
+                saved_id = wm.version_id
+
+        logger.info("World model saved to DB: domain=%s version=%s", target_domain, saved_id)
+        return saved_id
+
+    async def load_from_db(self, domain: str) -> DAGEngine:
+        """
+        Load a world model from PostgreSQL into in-memory cache.
+
+        Returns:
+            DAGEngine hydrated from the database row.
+        """
+        from src.storage.database import get_db_session, DatabaseService
+
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            wm = await db.get_active_world_model(domain)
+
+            if wm is None:
+                # Try the most recent regardless of status
+                from sqlalchemy import select
+                from src.storage.database import WorldModelVersionDB
+                result = await session.execute(
+                    select(WorldModelVersionDB)
+                    .where(WorldModelVersionDB.domain == domain)
+                    .order_by(WorldModelVersionDB.created_at.desc())
+                )
+                wm = result.scalars().first()
+
+            if wm is None:
+                raise ValueError(f"No world model found in DB for domain: {domain}")
+
+            # Reconstruct VariableDefinition and CausalEdge objects
+            variables: dict[str, VariableDefinition] = {}
+            for vid, vdata in (wm.variables or {}).items():
+                variables[vid] = VariableDefinition(
+                    variable_id=vid,
+                    name=vdata.get("name", vid),
+                    definition=vdata.get("definition", ""),
+                    type=VariableType(vdata["variable_type"]) if vdata.get("variable_type") else VariableType.CONTINUOUS,
+                    measurement_status=MeasurementStatus(vdata["measurement_status"]) if vdata.get("measurement_status") else MeasurementStatus.MEASURED,
+                    unit=vdata.get("unit"),
+                )
+
+            edges: list[CausalEdge] = []
+            for edata in (wm.edges or []):
+                edges.append(CausalEdge(
+                    from_var=edata["from_var"],
+                    to_var=edata["to_var"],
+                    metadata=EdgeMetadata(
+                        mechanism=edata.get("mechanism", ""),
+                        evidence_strength=EvidenceStrength(edata["strength"]) if edata.get("strength") else EvidenceStrength.HYPOTHESIS,
+                        evidence_refs=[UUID(r) for r in edata.get("evidence_refs", [])],
+                    ),
+                ))
+
+            model = WorldModelVersion(
+                version_id=wm.version_id,
+                domain=domain,
+                description=wm.description,
+                variables=variables,
+                edges=edges,
+                status=ModelStatus(wm.status) if wm.status else ModelStatus.DRAFT,
+            )
+
+            engine = DAGEngine.from_world_model(model)
+            self._engines[domain] = engine
+            self._active_domain = domain
+            logger.info("World model loaded from DB: domain=%s version=%s", domain, wm.version_id)
+            return engine

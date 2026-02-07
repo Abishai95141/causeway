@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 from enum import Enum
+import logging
 
 from src.agent.orchestrator import AgentOrchestrator
 from src.agent.llm_client import LLMClient
@@ -223,33 +224,54 @@ Respond with a JSON array of edges:
             engine = self.causal.create_world_model(domain)
             
             # Add variables
+            import re as _re
+            added_var_ids: set[str] = set()
             for var in variables:
-                engine.add_variable(
-                    variable_id=var.name.lower().replace(" ", "_"),
-                    name=var.name,
-                    definition=var.description,
-                    var_type=var.var_type,
-                    measurement_status=var.measurement_status,
-                )
+                # Sanitize: lowercase, replace non-alphanum with _, collapse runs
+                var_id = _re.sub(r'[^a-z0-9]+', '_', var.name.lower()).strip('_')
+                if not var_id or var_id in added_var_ids:
+                    continue
+                try:
+                    engine.add_variable(
+                        variable_id=var_id,
+                        name=var.name,
+                        definition=var.description,
+                        var_type=var.var_type,
+                        measurement_status=var.measurement_status,
+                    )
+                    added_var_ids.add(var_id)
+                except Exception:
+                    continue
             
             # Add edges
+            _logger = logging.getLogger(__name__)
             for edge in edges:
                 try:
+                    # Sanitize edge variable references the same way
+                    from_id = _re.sub(r'[^a-z0-9]+', '_', edge.from_var.lower()).strip('_')
+                    to_id = _re.sub(r'[^a-z0-9]+', '_', edge.to_var.lower()).strip('_')
                     engine.add_edge(
-                        from_var=edge.from_var,
-                        to_var=edge.to_var,
+                        from_var=from_id,
+                        to_var=to_id,
                         mechanism=edge.mechanism,
                         strength=edge.strength,
                     )
-                except Exception:
-                    # Skip invalid edges (cycles, missing nodes)
+                except Exception as _edge_err:
+                    # Log so we know why edges are being skipped
+                    _logger.warning("Edge %s→%s skipped: %s", edge.from_var, edge.to_var, _edge_err)
                     continue
             
             # Stage 5: Human Review
             self._current_stage = Mode1Stage.HUMAN_REVIEW
             world_model = engine.to_world_model(domain, f"World model for {domain}")
             world_model.status = ModelStatus.REVIEW
-            
+
+            # Persist draft to PostgreSQL
+            try:
+                await self.causal.save_to_db(domain=domain, version_id=world_model.version_id)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("DB save after run failed: %s", exc)
+
             return Mode1Result(
                 trace_id=trace_id,
                 domain=domain,
@@ -279,7 +301,7 @@ Respond with a JSON array of edges:
     ) -> list[VariableCandidate]:
         """Discover causal variables from evidence."""
         # Retrieve initial evidence
-        evidence = await self.retrieval.retrieve_simple(query, top_k=10)
+        evidence = await self.retrieval.retrieve_simple(query, max_results=10)
         
         # Cache evidence
         for e in evidence:
@@ -313,7 +335,7 @@ Respond with a JSON array of edges:
         
         for var in variables:
             query = f"{var.name}: {var.description}"
-            bundles = await self.retrieval.retrieve_simple(query, top_k=3)
+            bundles = await self.retrieval.retrieve_simple(query, max_results=3)
             
             evidence_map[var.name] = bundles
             
@@ -330,8 +352,9 @@ Respond with a JSON array of edges:
         max_edges: int,
     ) -> list[EdgeCandidate]:
         """Draft causal DAG structure using LLM."""
+        import re as _re
         variables_text = "\n".join([
-            f"- {v.name.lower().replace(' ', '_')}: {v.description}"
+            f"- {_re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')}: {v.description}"
             for v in variables
         ])
         
@@ -343,7 +366,10 @@ Respond with a JSON array of edges:
         response = await self.llm.generate(prompt)
         
         # Parse edges from response
+        _logger = logging.getLogger(__name__)
         edges = self._parse_edges(response.content)
+        _logger.info("DAG draft: parsed %d edges from LLM response (%d chars)",
+                     len(edges), len(response.content) if response.content else 0)
         
         self._edge_candidates = edges[:max_edges]
         return self._edge_candidates
@@ -355,69 +381,78 @@ Respond with a JSON array of edges:
         """Link evidence to edge candidates."""
         for edge in edges:
             query = f"{edge.from_var} causes {edge.to_var}: {edge.mechanism}"
-            bundles = await self.retrieval.retrieve_simple(query, top_k=2)
+            bundles = await self.retrieval.retrieve_simple(query, max_results=2)
             
             for b in bundles:
                 edge.evidence_refs.append(b.content_hash[:12])
                 self._evidence_cache[b.content_hash[:12]] = b
     
-    def _parse_variables(self, content: str) -> list[VariableCandidate]:
-        """Parse variables from LLM response."""
+    @staticmethod
+    def _extract_json_array(content: str) -> list[dict]:
+        """Robustly extract a JSON array from LLM content."""
         import json
         import re
-        
-        # Extract JSON from response
-        json_match = re.search(r'\[[\s\S]*\]', content)
-        if not json_match:
+
+        # Strategy 1: greedy match inside a fenced code block
+        m = re.search(r'```(?:json)?\s*(\[.*\])\s*```', content, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 2: find the outermost [ ... ] in the entire text
+        start = content.find('[')
+        end = content.rfind(']')
+        if start != -1 and end > start:
+            try:
+                return json.loads(content[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+
+        return []
+
+    def _parse_variables(self, content: str) -> list[VariableCandidate]:
+        """Parse variables from LLM response."""
+        data = self._extract_json_array(content)
+        if not data:
             return []
-        
-        try:
-            data = json.loads(json_match.group())
-            variables = []
-            for item in data:
-                var_type = item.get("type", "continuous").lower()
-                measurement = item.get("measurement_status", "measured").lower()
-                
-                variables.append(VariableCandidate(
-                    name=item.get("name", item.get("variable_id", "unknown")),
-                    description=item.get("description", ""),
-                    var_type=VariableType(var_type) if var_type in ["continuous", "discrete", "binary", "categorical"] else VariableType.CONTINUOUS,
-                    measurement_status=MeasurementStatus(measurement) if measurement in ["measured", "observable", "latent"] else MeasurementStatus.MEASURED,
-                ))
-            return variables
-        except json.JSONDecodeError:
-            return []
+
+        variables = []
+        for item in data:
+            var_type = item.get("type", "continuous").lower()
+            measurement = item.get("measurement_status", "measured").lower()
+
+            variables.append(VariableCandidate(
+                name=item.get("name", item.get("variable_id", "unknown")),
+                description=item.get("description", ""),
+                var_type=VariableType(var_type) if var_type in ["continuous", "discrete", "binary", "categorical"] else VariableType.CONTINUOUS,
+                measurement_status=MeasurementStatus(measurement) if measurement in ["measured", "observable", "latent"] else MeasurementStatus.MEASURED,
+            ))
+        return variables
     
     def _parse_edges(self, content: str) -> list[EdgeCandidate]:
         """Parse edges from LLM response."""
-        import json
-        import re
-        
-        # Extract JSON from response
-        json_match = re.search(r'\[[\s\S]*\]', content)
-        if not json_match:
+        data = self._extract_json_array(content)
+        if not data:
             return []
-        
-        try:
-            data = json.loads(json_match.group())
-            edges = []
-            for item in data:
-                strength_str = item.get("strength", "hypothesis").lower()
-                strength_map = {
-                    "strong": EvidenceStrength.STRONG,
-                    "moderate": EvidenceStrength.MODERATE,
-                    "hypothesis": EvidenceStrength.HYPOTHESIS,
-                }
-                
-                edges.append(EdgeCandidate(
-                    from_var=item.get("from_var", ""),
-                    to_var=item.get("to_var", ""),
-                    mechanism=item.get("mechanism", ""),
-                    strength=strength_map.get(strength_str, EvidenceStrength.HYPOTHESIS),
-                ))
-            return edges
-        except json.JSONDecodeError:
-            return []
+
+        edges = []
+        for item in data:
+            strength_str = item.get("strength", "hypothesis").lower()
+            strength_map = {
+                "strong": EvidenceStrength.STRONG,
+                "moderate": EvidenceStrength.MODERATE,
+                "hypothesis": EvidenceStrength.HYPOTHESIS,
+            }
+
+            edges.append(EdgeCandidate(
+                from_var=item.get("from_var", ""),
+                to_var=item.get("to_var", ""),
+                mechanism=item.get("mechanism", ""),
+                strength=strength_map.get(strength_str, EvidenceStrength.HYPOTHESIS),
+            ))
+        return edges
     
     def _create_audit(
         self,
@@ -437,13 +472,19 @@ Respond with a JSON array of edges:
         domain: str,
         approved_by: str,
     ) -> WorldModelVersion:
-        """Approve and activate a world model."""
+        """Approve and activate a world model, persisting to PostgreSQL."""
         engine = self.causal.get_engine(domain)
         model = engine.to_world_model(domain, f"World model for {domain}")
         
         model.status = ModelStatus.ACTIVE
         model.approved_by = approved_by
         model.approved_at = datetime.now(timezone.utc)
+        
+        # Persist to PostgreSQL
+        try:
+            await self.causal.save_to_db(domain=domain, version_id=model.version_id)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("DB save on approve failed: %s", exc)
         
         self._current_stage = Mode1Stage.COMPLETE
         

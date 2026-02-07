@@ -6,24 +6,32 @@ Implements all REST endpoints:
 - Indexing triggers
 - Mode 1/2 execution
 - World model retrieval
+
+All document metadata is persisted in PostgreSQL via DatabaseService.
 """
 
 import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
+from sqlalchemy import String
 
 from src.config import get_settings
 from src.storage.object_store import ObjectStore
+from src.storage.database import get_db_session, DatabaseService
 from src.retrieval.router import RetrievalRouter
 from src.modes.mode1 import Mode1WorldModelConstruction, Mode1Stage
 from src.modes.mode2 import Mode2DecisionSupport, Mode2Stage
 from src.causal.service import CausalService
-from src.models.enums import IngestionStatus, ModelStatus
+from src.protocol.state_machine import ProtocolStateMachine
+from src.protocol.mode_router import ModeRouter
+from src.models.enums import IngestionStatus, ModelStatus, OperatingMode
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -33,6 +41,24 @@ _retrieval_router: Optional[RetrievalRouter] = None
 _causal_service: Optional[CausalService] = None
 _mode1: Optional[Mode1WorldModelConstruction] = None
 _mode2: Optional[Mode2DecisionSupport] = None
+_protocol_sm: Optional[ProtocolStateMachine] = None
+_mode_router: Optional[ModeRouter] = None
+
+
+def get_protocol_sm() -> ProtocolStateMachine:
+    """Get or create the protocol state machine singleton."""
+    global _protocol_sm
+    if _protocol_sm is None:
+        _protocol_sm = ProtocolStateMachine()
+    return _protocol_sm
+
+
+def get_mode_router() -> ModeRouter:
+    """Get or create the mode router."""
+    global _mode_router
+    if _mode_router is None:
+        _mode_router = ModeRouter()
+    return _mode_router
 
 
 async def get_object_store() -> ObjectStore:
@@ -163,6 +189,64 @@ class ApprovalRequest(BaseModel):
     approved_by: str
 
 
+# ===== Search Endpoint =====
+
+class SearchRequest(BaseModel):
+    """Request for direct evidence search."""
+    query: str = Field(..., description="Search query")
+    max_results: int = Field(default=5, ge=1, le=50)
+    doc_id: Optional[str] = Field(default=None, description="Filter to a specific document")
+
+
+class SearchResult(BaseModel):
+    """A single search result."""
+    content: str
+    doc_id: str
+    doc_title: str
+    score: float = 0.0
+    section: Optional[str] = None
+    page: Optional[int] = None
+
+
+class SearchResponse(BaseModel):
+    """Response from search endpoint."""
+    query: str
+    total_results: int
+    results: list[SearchResult]
+
+
+@router.post("/search", response_model=SearchResponse)
+async def search_evidence(request: SearchRequest):
+    """
+    Direct semantic search over indexed documents.
+    No LLM required — just retrieval.
+    """
+    retrieval = await get_retrieval_router()
+
+    bundles = await retrieval.retrieve_simple(
+        query=request.query,
+        max_results=request.max_results,
+    )
+
+    results = [
+        SearchResult(
+            content=b.content[:1000],
+            doc_id=b.source.doc_id,
+            doc_title=b.source.doc_title,
+            score=b.retrieval_trace.scores.get("vector", 0.0) if b.retrieval_trace.scores else 0.0,
+            section=b.location.section_name,
+            page=b.location.page_number,
+        )
+        for b in bundles
+    ]
+
+    return SearchResponse(
+        query=request.query,
+        total_results=len(results),
+        results=results,
+    )
+
+
 # ===== Document Endpoints =====
 
 @router.post("/uploads", response_model=DocumentResponse)
@@ -174,6 +258,7 @@ async def upload_document(
     Upload a document for processing.
     
     Supported formats: PDF, TXT, MD, XLSX
+    Persists metadata to PostgreSQL and binary to MinIO.
     """
     # Validate file type
     allowed_types = {".pdf", ".txt", ".md", ".xlsx", ".csv"}
@@ -190,19 +275,35 @@ async def upload_document(
     content = await file.read()
     content_hash = hashlib.sha256(content).hexdigest()
     
-    # Generate document ID
+    # Generate document ID (string-based for consistency)
     internal_id = uuid4()
     doc_id = f"doc_{internal_id.hex[:12]}"
+    content_type = file.content_type or "application/octet-stream"
     
-    # Upload to object store
+    # Upload binary to object store
     store = await get_object_store()
-    # storage_uri is returned by upload_bytes, not passed to it
     storage_uri = store.upload_bytes(
-        doc_id=internal_id,
+        doc_id=doc_id,
         filename=filename,
         content=content,
-        content_type=file.content_type or "application/octet-stream"
+        content_type=content_type,
     )
+    
+    # Persist metadata to PostgreSQL
+    try:
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            await db.create_document(
+                doc_id=internal_id,
+                filename=filename,
+                content_type=content_type,
+                size_bytes=len(content),
+                sha256=content_hash,
+                storage_uri=storage_uri,
+                ingestion_status=IngestionStatus.PENDING.value,
+            )
+    except Exception as exc:
+        logger.warning("DB persist failed (non-fatal): %s", exc)
     
     return DocumentResponse(
         doc_id=doc_id,
@@ -216,94 +317,152 @@ async def upload_document(
 
 @router.get("/documents/{doc_id}", response_model=DocumentResponse)
 async def get_document(doc_id: str):
-    """Get document metadata by ID."""
-    # In production, would query database
-    # For now, return mock response
-    return DocumentResponse(
-        doc_id=doc_id,
-        filename="placeholder.txt",
-        content_hash="placeholder",
-        storage_uri=f"documents/{doc_id}/placeholder.txt",
-        status=IngestionStatus.PENDING.value,
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
+    """Get document metadata by ID from PostgreSQL."""
+    # Extract the UUID portion from doc_id (e.g. "doc_abc123def456" → UUID)
+    try:
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            # Try lookup by the hex prefix embedded in doc_id
+            hex_part = doc_id.replace("doc_", "") if doc_id.startswith("doc_") else doc_id
+            # List all documents and match by storage_uri or doc_id pattern
+            from sqlalchemy import select
+            from src.storage.database import DocumentRecordDB
+            result = await session.execute(
+                select(DocumentRecordDB).where(
+                    DocumentRecordDB.storage_uri.contains(doc_id)
+                )
+            )
+            record = result.scalar_one_or_none()
+
+            if record is None:
+                # Fallback: try by sha256 or broad match
+                result = await session.execute(
+                    select(DocumentRecordDB).where(
+                        DocumentRecordDB.doc_id.cast(String).startswith(hex_part[:12])
+                    )
+                )
+                record = result.scalar_one_or_none()
+
+            if record is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Document not found: {doc_id}",
+                )
+
+            return DocumentResponse(
+                doc_id=doc_id,
+                filename=record.filename,
+                content_hash=record.sha256,
+                storage_uri=record.storage_uri,
+                status=record.ingestion_status,
+                created_at=record.created_at.isoformat(),
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("DB lookup failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(exc)}",
+        )
 
 
 @router.post("/index/{doc_id}", response_model=IndexResponse)
 async def index_document(doc_id: str, request: Optional[IndexRequest] = None):
-    """Trigger indexing for a document."""
-    router = await get_retrieval_router()
+    """Trigger indexing for a document. Updates status in PostgreSQL."""
+    retrieval = await get_retrieval_router()
     store = await get_object_store()
     
-    # 1. content: Fetch document from ObjectStore
-    # Using list_files to find the file if filename is not provided
+    # Resolve filename — prefer the request, then DB record, then fallback
     filename = request.filename if request else None
-    
-    if not filename:
-        # Try to find file with this doc_id prefix
-        files = store.list_files(prefix=f"uploads/{doc_id}")
-        if not files:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Document file not found for ID: {doc_id} in uploads/"
-            )
-        # Use simple logic: pick the first one matching
-        # Note: ObjectStore stores as uploads/{doc_id}.ext or uploads/{doc_id}
-        # The list_files returns 'uploads/<doc_id>.ext'
-        object_name = files[0]
-        filename = object_name.split("/")[-1]
-    
-    # Generate storage URI using internal method logic or manual construction
-    # ObjectStore uses manual construction in upload_bytes, but we need URI for download
-    # Since we found it via list_files, we can use the object name
-    storage_uri = f"s3://{store.bucket}/{object_name}" if not filename else None
-    
-    # If we constructed logic above correctly, object_name is available from list_files
-    # But if filename WAS provided, we need to reconstruct object_name
-    if not locals().get("object_name"):
-        # Reconstruct object_name logic from ObjectStore._generate_object_name
-        # This is brittle, ideally ObjectStore exposes public method
-        # But we can try List again to be safe if performance allows, or just use list_files always
-        files = store.list_files(prefix=f"uploads/{doc_id}")
-        if not files:
-             raise HTTPException(status_code=404, detail="File not found")
-        object_name = files[0]
-        storage_uri = f"s3://{store.bucket}/{object_name}"
 
+    files = store.list_files(prefix=f"uploads/{doc_id}")
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document file not found for ID: {doc_id} in uploads/",
+        )
+    object_name = files[0]
+
+    # Look up the original filename from PostgreSQL if not supplied
+    if not filename:
+        try:
+            async with get_db_session() as session:
+                from sqlalchemy import select
+                from src.storage.database import DocumentRecordDB
+                row = (await session.execute(
+                    select(DocumentRecordDB).where(
+                        DocumentRecordDB.storage_uri.contains(doc_id)
+                    )
+                )).scalar_one_or_none()
+                if row and row.filename:
+                    filename = row.filename
+        except Exception as exc:
+            logger.warning("DB filename lookup failed (non-fatal): %s", exc)
+
+    # Ultimate fallback to object name
+    if not filename:
+        filename = object_name.split("/")[-1]
+
+    # Download binary from MinIO
+    storage_uri = f"s3://{store.bucket}/{object_name}"
     try:
         content = store.download_file(storage_uri)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read document content: {str(e)}"
+            detail=f"Failed to read document content: {str(e)}",
         )
 
-    # 2. Extract text & 3. Index via router
+    # Determine content type from extension
+    ext = filename.split(".")[-1].lower() if "." in filename else "txt"
+    content_type = {
+        "pdf": "application/pdf",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "csv": "text/csv",
+        "md": "text/markdown",
+    }.get(ext, "text/plain")
+
     try:
-        # Determine content type from filename extension
-        ext = filename.split(".")[-1].lower() if "." in filename else "txt"
-        content_type = "text/plain"
-        if ext == "pdf":
-            content_type = "application/pdf"
-        elif ext == "md":
-            content_type = "text/markdown"
-            
-        result = await router.ingest_document(
+        result = await retrieval.ingest_document(
             doc_id=doc_id,
             filename=filename,
             content=content,
-            content_type=content_type
+            content_type=content_type,
         )
-        
+
+        chunk_ids = result.get("haystack_chunk_ids", [])
+
+        # Update status in PostgreSQL
+        try:
+            async with get_db_session() as session:
+                db = DatabaseService(session)
+                from sqlalchemy import select
+                from src.storage.database import DocumentRecordDB
+
+                row = (await session.execute(
+                    select(DocumentRecordDB).where(
+                        DocumentRecordDB.storage_uri.contains(doc_id)
+                    )
+                )).scalar_one_or_none()
+
+                if row:
+                    row.ingestion_status = IngestionStatus.INDEXED.value
+                    row.haystack_doc_ids = chunk_ids
+                    row.updated_at = datetime.now(timezone.utc)
+                    await session.flush()
+        except Exception as exc:
+            logger.warning("DB status update failed (non-fatal): %s", exc)
+
         return IndexResponse(
             doc_id=doc_id,
             status=IngestionStatus.INDEXING.value,
-            message=f"Document indexed successfully. Chunks: {len(result.get('haystack_chunk_ids', []))}",
+            message=f"Document indexed successfully. Chunks: {len(chunk_ids)}",
         )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Indexing failed: {str(e)}"
+            detail=f"Indexing failed: {str(e)}",
         )
 
 
@@ -335,6 +494,14 @@ async def run_mode1(request: Mode1Request):
         requires_review=result.requires_review,
         error=result.error,
     )
+
+
+@router.get("/mode1/status")
+async def get_mode1_status():
+    """Return the current live stage of Mode 1 (useful for polling)."""
+    if _mode1 is None:
+        return {"stage": "idle", "detail": "Mode 1 not initialised"}
+    return {"stage": _mode1.current_stage.value}
 
 
 @router.post("/mode1/approve", response_model=WorldModelSummary)
@@ -401,10 +568,12 @@ async def run_mode2(request: Mode2Request):
 
 @router.get("/world-models", response_model=list[WorldModelSummary])
 async def list_world_models():
-    """List all world models."""
+    """List all world models (from in-memory + DB)."""
     causal = get_causal_service()
-    
+
     summaries = []
+
+    # In-memory models (actively loaded)
     for domain in causal.list_domains():
         summary = causal.get_model_summary(domain)
         summaries.append(WorldModelSummary(
@@ -414,26 +583,188 @@ async def list_world_models():
             status=ModelStatus.ACTIVE.value if summary["is_valid"] else ModelStatus.DRAFT.value,
             variables=summary["variables"],
         ))
-    
+
+    # Supplement with DB-persisted models not yet loaded
+    try:
+        async with get_db_session() as session:
+            from sqlalchemy import select
+            from src.storage.database import WorldModelVersionDB
+            result = await session.execute(select(WorldModelVersionDB))
+            for wm in result.scalars().all():
+                if wm.domain not in causal.list_domains():
+                    variables = list(wm.variables.keys()) if isinstance(wm.variables, dict) else []
+                    edges = wm.edges if isinstance(wm.edges, list) else []
+                    summaries.append(WorldModelSummary(
+                        domain=wm.domain,
+                        version_id=wm.version_id,
+                        node_count=len(variables),
+                        edge_count=len(edges),
+                        status=wm.status,
+                        variables=variables,
+                    ))
+    except Exception as exc:
+        logger.warning("DB world-model list failed (showing in-memory only): %s", exc)
+
     return summaries
 
 
 @router.get("/world-models/{domain}", response_model=WorldModelSummary)
 async def get_world_model(domain: str):
-    """Get a specific world model by domain."""
+    """Get a specific world model by domain (in-memory or DB)."""
     causal = get_causal_service()
-    
-    if domain not in causal.list_domains():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"World model not found: {domain}",
+
+    # Check in-memory first
+    if domain in causal.list_domains():
+        summary = causal.get_model_summary(domain)
+        return WorldModelSummary(
+            domain=domain,
+            node_count=summary["node_count"],
+            edge_count=summary["edge_count"],
+            status=ModelStatus.ACTIVE.value if summary["is_valid"] else ModelStatus.DRAFT.value,
+            variables=summary["variables"],
         )
-    
-    summary = causal.get_model_summary(domain)
-    return WorldModelSummary(
-        domain=domain,
-        node_count=summary["node_count"],
-        edge_count=summary["edge_count"],
-        status=ModelStatus.ACTIVE.value if summary["is_valid"] else ModelStatus.DRAFT.value,
-        variables=summary["variables"],
+
+    # Fallback: try PostgreSQL
+    try:
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            wm = await db.get_active_world_model(domain)
+            if wm is None:
+                # Try any status
+                from sqlalchemy import select
+                from src.storage.database import WorldModelVersionDB
+                result = await session.execute(
+                    select(WorldModelVersionDB).where(
+                        WorldModelVersionDB.domain == domain
+                    ).order_by(WorldModelVersionDB.created_at.desc())
+                )
+                wm = result.scalars().first()
+
+            if wm:
+                variables = list(wm.variables.keys()) if isinstance(wm.variables, dict) else []
+                edges = wm.edges if isinstance(wm.edges, list) else []
+                return WorldModelSummary(
+                    domain=domain,
+                    version_id=wm.version_id,
+                    node_count=len(variables),
+                    edge_count=len(edges),
+                    status=wm.status,
+                    variables=variables,
+                )
+    except Exception as exc:
+        logger.warning("DB world-model lookup failed: %s", exc)
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"World model not found: {domain}",
     )
+
+
+# ===== Unified Query Endpoint (Protocol-aware) =====
+
+class QueryRequest(BaseModel):
+    """Unified query request — the protocol routes to Mode 1 or Mode 2."""
+    query: str = Field(..., description="Natural-language query or command")
+    session_id: Optional[str] = None
+
+
+class QueryResponse(BaseModel):
+    """Unified query response."""
+    trace_id: str
+    routed_mode: str
+    confidence: float
+    route_reason: str
+    result: dict[str, Any] = {}
+    error: Optional[str] = None
+
+
+@router.post("/query", response_model=QueryResponse)
+async def unified_query(request: QueryRequest):
+    """
+    Unified entry point that auto-routes to Mode 1 or Mode 2
+    using the ProtocolStateMachine + ModeRouter.
+    """
+    sm = get_protocol_sm()
+    mr = get_mode_router()
+
+    # Classify the query
+    decision = mr.route(request.query)
+
+    try:
+        async with sm.run(request.query, session_id=request.session_id) as ctx:
+            await sm.set_mode(decision.mode)
+
+            if decision.mode == OperatingMode.MODE_1:
+                mode1 = await get_mode1()
+                domain = decision.extracted_domain or "general"
+                m1_result = await mode1.run(
+                    domain=domain,
+                    initial_query=request.query,
+                )
+                await sm.complete_discovery()
+                ctx.result = {
+                    "trace_id": m1_result.trace_id,
+                    "domain": m1_result.domain,
+                    "stage": m1_result.stage.value,
+                    "variables_discovered": m1_result.variables_discovered,
+                    "edges_created": m1_result.edges_created,
+                    "requires_review": m1_result.requires_review,
+                    "error": m1_result.error,
+                }
+            else:
+                mode2 = await get_mode2()
+                m2_result = await mode2.run(
+                    query=request.query,
+                    domain_hint=decision.extracted_domain,
+                )
+                await sm.complete_decision_support()
+
+                rec_text = None
+                conf_text = None
+                if m2_result.recommendation:
+                    rec_text = m2_result.recommendation.recommendation
+                    conf_text = m2_result.recommendation.confidence.value
+
+                ctx.result = {
+                    "trace_id": m2_result.trace_id,
+                    "query": m2_result.query,
+                    "stage": m2_result.stage.value,
+                    "recommendation": rec_text,
+                    "confidence": conf_text,
+                    "evidence_count": m2_result.evidence_count,
+                    "escalate_to_mode1": m2_result.escalate_to_mode1,
+                    "error": m2_result.error,
+                }
+
+        return QueryResponse(
+            trace_id=ctx.trace_id,
+            routed_mode=decision.mode.value,
+            confidence=decision.confidence,
+            route_reason=decision.reason.value,
+            result=ctx.result or {},
+        )
+
+    except Exception as exc:
+        logger.error("Unified query failed: %s", exc)
+        return QueryResponse(
+            trace_id="error",
+            routed_mode=decision.mode.value,
+            confidence=decision.confidence,
+            route_reason=decision.reason.value,
+            error=str(exc),
+        )
+
+
+# ===== Protocol Status =====
+
+@router.get("/protocol/status")
+async def protocol_status():
+    """Get current protocol state machine status."""
+    sm = get_protocol_sm()
+    return {
+        "state": sm.state.value,
+        "is_idle": sm.is_idle,
+        "is_running": sm.is_running,
+        "is_waiting_review": sm.is_waiting_review,
+        "history": sm.get_state_history(),
+    }

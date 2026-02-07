@@ -8,6 +8,7 @@ Main application entry point with:
 - OpenTelemetry hooks (minimal)
 """
 
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,9 @@ import time
 
 from src.api.routes import router
 from src.config import get_settings
+from src.storage.database import init_db, get_engine
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -28,11 +32,20 @@ async def lifespan(app: FastAPI):
     app.state.start_time = datetime.now(timezone.utc)
     app.state.request_count = 0
     app.state.error_count = 0
-    
+
+    # Initialise PostgreSQL schema
+    try:
+        await init_db()
+        logger.info("PostgreSQL tables created / verified")
+    except Exception as exc:
+        logger.warning("PostgreSQL init failed (will retry on first request): %s", exc)
+
     yield
-    
-    # Shutdown
-    pass
+
+    # Shutdown — dispose of the SQLAlchemy engine
+    engine = get_engine()
+    await engine.dispose()
+    logger.info("Database engine disposed")
 
 
 app = FastAPI(
@@ -46,7 +59,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

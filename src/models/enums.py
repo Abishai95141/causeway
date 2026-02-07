@@ -73,3 +73,5 @@ class ProtocolState(str, Enum):
     # Mode 2 states
     DECISION_SUPPORT_RUNNING = "decision_support_running"
     RESPONSE_READY = "response_ready"
+    # Error state
+    ERROR = "error"
