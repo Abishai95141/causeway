@@ -140,4 +140,4 @@ GEMINI_API_KEY=your_key
 
 ## License
 
-MIT
+Apache License 2.0
