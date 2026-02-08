@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
-from src.models.enums import EvidenceStrength, MeasurementStatus, ModelStatus, VariableType
+from src.models.enums import EvidenceStrength, MeasurementStatus, ModelStatus, VariableRole, VariableType
 
 
 class VariableDefinition(BaseModel):
@@ -25,6 +25,10 @@ class VariableDefinition(BaseModel):
         description="Where data for this variable comes from"
     )
     unit: Optional[str] = Field(default=None, description="Unit of measurement if applicable")
+    role: VariableRole = Field(
+        default=VariableRole.UNKNOWN,
+        description="Causal role in the DAG (treatment, outcome, confounder, etc.)"
+    )
     
     @field_validator("variable_id")
     @classmethod
@@ -48,9 +52,17 @@ class EdgeMetadata(BaseModel):
         default_factory=list,
         description="EvidenceBundle IDs supporting this edge"
     )
+    contradicting_refs: list[UUID] = Field(
+        default_factory=list,
+        description="EvidenceBundle IDs contradicting this edge"
+    )
     assumptions: list[str] = Field(
         default_factory=list,
         description="Assumptions underlying this causal relationship"
+    )
+    conditions: list[str] = Field(
+        default_factory=list,
+        description="Conditions under which this relationship holds (e.g., 'segment=price_sensitive')"
     )
     confidence: float = Field(
         default=0.5,

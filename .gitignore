@@ -58,3 +58,25 @@ cover/
 
 # Custom
 agent_state/
+
+# OS specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Large files / Documents
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+
+# Logs
+*.log
+
+# Accidental files
+-d
+-H

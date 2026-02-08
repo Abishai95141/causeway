@@ -244,7 +244,12 @@ async def search_evidence(request: SearchRequest):
             content=b.content[:1000],
             doc_id=b.source.doc_id,
             doc_title=b.source.doc_title,
-            score=b.retrieval_trace.scores.get("vector", 0.0) if b.retrieval_trace.scores else 0.0,
+            score=(
+                b.retrieval_trace.scores.get("vector")
+                or b.retrieval_trace.scores.get("fused")
+                or b.retrieval_trace.scores.get("similarity")
+                or max(b.retrieval_trace.scores.values(), default=0.0)
+            ) if b.retrieval_trace.scores else b.retrieval_trace.confidence,
             section=b.location.section_name,
             page=b.location.page_number,
         )

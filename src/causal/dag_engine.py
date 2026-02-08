@@ -21,7 +21,7 @@ from src.models.causal import (
     EdgeMetadata,
     WorldModelVersion,
 )
-from src.models.enums import EvidenceStrength, MeasurementStatus, ModelStatus, VariableType
+from src.models.enums import EvidenceStrength, MeasurementStatus, ModelStatus, VariableRole, VariableType
 
 
 class CycleDetectedError(Exception):
@@ -101,6 +101,7 @@ class DAGEngine:
         measurement_status: MeasurementStatus = MeasurementStatus.MEASURED,
         unit: Optional[str] = None,
         data_source: Optional[str] = None,
+        role: VariableRole = VariableRole.UNKNOWN,
     ) -> VariableDefinition:
         """
         Add a variable (node) to the DAG.
@@ -113,6 +114,7 @@ class DAGEngine:
             measurement_status: Whether it can be measured
             unit: Measurement unit (optional)
             data_source: Where data comes from (optional)
+            role: Causal role (treatment, outcome, confounder, etc.)
             
         Returns:
             Created VariableDefinition
@@ -128,6 +130,7 @@ class DAGEngine:
             measurement_status=measurement_status,
             unit=unit,
             data_source=data_source,
+            role=role,
         )
         
         self._variables[variable_id] = variable
@@ -143,6 +146,9 @@ class DAGEngine:
         strength: EvidenceStrength = EvidenceStrength.HYPOTHESIS,
         evidence_refs: Optional[list[UUID]] = None,
         confidence: float = 0.5,
+        assumptions: Optional[list[str]] = None,
+        conditions: Optional[list[str]] = None,
+        contradicting_refs: Optional[list[UUID]] = None,
     ) -> CausalEdge:
         """
         Add a causal edge to the DAG.
@@ -152,8 +158,11 @@ class DAGEngine:
             to_var: Target variable ID
             mechanism: Explanation of causal mechanism
             strength: Evidence strength classification
-            evidence_refs: List of evidence bundle UUIDs
+            evidence_refs: List of evidence bundle UUIDs supporting this edge
             confidence: Confidence score (0-1)
+            assumptions: Causal assumptions underlying this edge
+            conditions: Conditions under which this relationship holds
+            contradicting_refs: Evidence bundle UUIDs contradicting this edge
             
         Returns:
             Created CausalEdge
@@ -189,6 +198,9 @@ class DAGEngine:
                 mechanism=mechanism,
                 evidence_strength=strength,
                 evidence_refs=evidence_refs or [],
+                contradicting_refs=contradicting_refs or [],
+                assumptions=assumptions or [],
+                conditions=conditions or [],
                 confidence=confidence,
             ),
         )
@@ -199,6 +211,9 @@ class DAGEngine:
             mechanism=mechanism,
             strength=strength.value,
             evidence_refs=evidence_refs or [],
+            contradicting_refs=contradicting_refs or [],
+            assumptions=assumptions or [],
+            conditions=conditions or [],
         )
         
         return edge

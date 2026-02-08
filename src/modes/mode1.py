@@ -4,9 +4,16 @@ Mode 1: World Model Construction
 Implements the full Mode 1 workflow:
 1. Variable Discovery - Identify causal variables from evidence
 2. Evidence Gathering - Deep search for supporting evidence
-3. DAG Drafting - Build causal structure using LLM
-4. Evidence Triangulation - Link evidence to edges
+3. DAG Drafting - Build causal structure using PyWhyLLM bridge + LLM
+4. Evidence Triangulation - Link & validate evidence for each edge
 5. Human Review - Approval gate before activation
+
+Phase 1 improvements:
+- PyWhyLLM bridge for structured causal reasoning
+- Evidence-grounded edge creation (every edge must cite evidence)
+- Evidence strength classification (strong/moderate/hypothesis/contested)
+- Contradiction detection during triangulation
+- Variable role classification (treatment, outcome, confounder, mediator)
 """
 
 from dataclasses import dataclass, field
@@ -20,12 +27,14 @@ from src.agent.orchestrator import AgentOrchestrator
 from src.agent.llm_client import LLMClient
 from src.causal.service import CausalService
 from src.causal.dag_engine import DAGEngine
-from src.retrieval.router import RetrievalRouter
+from src.causal.pywhyllm_bridge import CausalGraphBridge, EdgeProposal, BridgeResult
+from src.retrieval.router import RetrievalRouter, RetrievalRequest, RetrievalStrategy
 from src.models.causal import WorldModelVersion, VariableDefinition, CausalEdge
 from src.models.evidence import EvidenceBundle
 from src.models.enums import (
     EvidenceStrength,
     ModelStatus,
+    VariableRole,
     VariableType,
     MeasurementStatus,
 )
@@ -62,16 +71,23 @@ class VariableCandidate:
     measurement_status: MeasurementStatus
     evidence_sources: list[str] = field(default_factory=list)
     confidence: float = 0.5
+    role: VariableRole = VariableRole.UNKNOWN
 
 
 @dataclass
 class EdgeCandidate:
-    """A candidate causal edge from LLM analysis."""
+    """A candidate causal edge with evidence grounding."""
     from_var: str
     to_var: str
     mechanism: str
     strength: EvidenceStrength
     evidence_refs: list[str] = field(default_factory=list)
+    evidence_bundle_ids: list[UUID] = field(default_factory=list)
+    contradicting_refs: list[str] = field(default_factory=list)
+    contradicting_bundle_ids: list[UUID] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    conditions: list[str] = field(default_factory=list)
+    confidence: float = 0.5
 
 
 @dataclass
@@ -87,6 +103,9 @@ class Mode1Result:
     audit_entries: list["AuditStep"] = field(default_factory=list)
     error: Optional[str] = None
     requires_review: bool = False
+    conflicts_detected: int = 0
+    critical_conflicts: int = 0
+    conflict_details: list[dict] = field(default_factory=list)
 
 
 class Mode1WorldModelConstruction:
@@ -96,32 +115,82 @@ class Mode1WorldModelConstruction:
     Builds causal world models through:
     - LLM-guided variable discovery
     - Evidence retrieval and triangulation
-    - DAG structure generation
+    - PyWhyLLM-powered DAG structure generation with evidence grounding
     - Human approval workflow
     """
     
-    VARIABLE_DISCOVERY_PROMPT = """You are analyzing documents to identify causal variables for a decision domain.
+    VARIABLE_DISCOVERY_PROMPT = """You are analyzing documents to identify ALL causal variables for a decision domain.
 
 Domain: {domain}
 
-Based on the evidence below, identify the key variables that could affect decisions in this domain.
-For each variable, provide:
-- variable_id: A snake_case identifier
+TASK: Read the evidence below and extract EVERY measurable variable mentioned or implied.
+A causal model needs MANY variables to be useful — typically 8-15.
+
+Think through these categories and extract variables from each:
+1. INPUTS: resources, costs, investments, staffing, materials
+2. PROCESSES: operations, methods, techniques, strategies
+3. OUTPUTS: revenue, production, performance metrics
+4. QUALITY: product quality, service quality, standards
+5. DEMAND: customer traffic, market size, seasonal factors
+6. SATISFACTION: customer satisfaction, retention, loyalty
+7. COMPETITION: competitor actions, market position
+8. ENVIRONMENT: location, regulations, economic conditions
+
+For each variable provide:
+- variable_id: snake_case identifier (e.g., "employee_training_hours")
 - name: Human-readable name
-- description: What this variable represents
+- description: What this variable represents and how it could be measured
 - type: continuous, discrete, binary, or categorical
 - measurement_status: measured, observable, or latent
 
 Evidence:
 {evidence}
 
-Respond with a JSON array of variables:
+Return a JSON array with AT LEAST 8 variables. Include every factor mentioned in the evidence:
 ```json
 [
-  {{"variable_id": "...", "name": "...", "description": "...", "type": "...", "measurement_status": "..."}}
+  {{"variable_id": "example_var", "name": "Example Variable", "description": "...", "type": "continuous", "measurement_status": "measured"}}
 ]
 ```"""
 
+    EVIDENCE_GROUNDED_DAG_PROMPT = """You are building a causal DAG for decision support.
+IMPORTANT: Every proposed edge MUST be grounded in the evidence provided below.
+Do NOT propose relationships based solely on general knowledge — cite specific evidence.
+
+Domain: {domain}
+
+Variables in the model (use these EXACT IDs as from_var / to_var):
+{variables}
+
+Available evidence (each prefixed with its hash ID):
+{evidence}
+
+TASK: Systematically consider ALL possible pairs of variables and identify
+causal relationships supported by the evidence. You should find MULTIPLE edges —
+a model with only 1 or 2 edges for 5+ variables is almost certainly incomplete.
+
+For each causal edge you propose, you MUST:
+1. Use the EXACT variable IDs listed above (the snake_case identifiers before the colon)
+2. Reference which evidence hash IDs support the relationship
+3. Describe the causal mechanism found in the evidence
+4. Note any assumptions required for this causal claim
+5. Rate strength based on evidence count: strong (3+ sources), moderate (2 sources), hypothesis (1 source)
+
+Respond with a JSON array of edges:
+```json
+[
+  {{
+    "from_var": "exact_variable_id",
+    "to_var": "exact_variable_id",
+    "mechanism": "...",
+    "strength": "hypothesis|moderate|strong",
+    "evidence_ids": ["hash1", "hash2"],
+    "assumptions": ["assumption 1", "assumption 2"]
+  }}
+]
+```"""
+
+    # Legacy prompt kept for fallback if bridge is unavailable
     DAG_DRAFTING_PROMPT = """You are building a causal DAG for decision support.
 
 Domain: {domain}
@@ -148,10 +217,19 @@ Respond with a JSON array of edges:
         llm_client: Optional[LLMClient] = None,
         retrieval_router: Optional[RetrievalRouter] = None,
         causal_service: Optional[CausalService] = None,
+        causal_bridge: Optional[CausalGraphBridge] = None,
     ):
         self.llm = llm_client or LLMClient()
         self.retrieval = retrieval_router or RetrievalRouter()
         self.causal = causal_service or CausalService()
+
+        # PyWhyLLM bridge — auto-creates from config if not injected
+        if causal_bridge is not None:
+            self.bridge = causal_bridge
+        else:
+            from src.config import get_settings
+            settings = get_settings()
+            self.bridge = CausalGraphBridge(api_key=settings.google_ai_api_key)
         
         self._current_stage = Mode1Stage.VARIABLE_DISCOVERY
         self._evidence_cache: dict[str, EvidenceBundle] = {}
@@ -217,9 +295,18 @@ Respond with a JSON array of edges:
             # Stage 4: Evidence Triangulation
             self._current_stage = Mode1Stage.EVIDENCE_TRIANGULATION
             await self._triangulate_evidence(edges)
+            supporting_total = sum(len(e.evidence_refs) for e in edges)
+            contradicting_total = sum(len(e.contradicting_refs) for e in edges)
+            contested_count = sum(
+                1 for e in edges if e.strength == EvidenceStrength.CONTESTED
+            )
             audit_entries.append(self._create_audit(
                 trace_id, "evidence_triangulation_complete",
-                {"linked_evidence": sum(len(e.evidence_refs) for e in edges)}
+                {
+                    "linked_evidence": supporting_total,
+                    "contradicting_evidence": contradicting_total,
+                    "contested_edges": contested_count,
+                }
             ))
             
             # Build the world model
@@ -241,6 +328,7 @@ Respond with a JSON array of edges:
                         definition=var.description,
                         var_type=var.var_type,
                         measurement_status=var.measurement_status,
+                        role=var.role,
                     )
                     added_var_ids.add(var_id)
                 except Exception as _var_err:
@@ -249,13 +337,37 @@ Respond with a JSON array of edges:
 
             _logger.info("Added %d variables to engine: %s", len(added_var_ids), sorted(added_var_ids))
 
-            # Add edges
+            # Build a fuzzy matcher: if the LLM returns a shortened variable ID,
+            # try to find the closest match among added variables.
+            def _resolve_var_id(raw_id: str) -> str:
+                """Resolve a possibly-abbreviated variable ID to an actual one."""
+                sanitized = _re.sub(r'[^a-z0-9]+', '_', raw_id.lower()).strip('_')
+                if sanitized in added_var_ids:
+                    return sanitized
+                # Try suffix match: "customer_traffic" should match "daily_customer_traffic"
+                suffix_matches = [v for v in added_var_ids if v.endswith(sanitized)]
+                if len(suffix_matches) == 1:
+                    return suffix_matches[0]
+                # Try substring match: pick the shortest variable that contains the ID
+                contains_matches = sorted(
+                    [v for v in added_var_ids if sanitized in v],
+                    key=len,
+                )
+                if len(contains_matches) == 1:
+                    return contains_matches[0]
+                # Try the reverse: does the raw ID contain any variable ID?
+                contained_in = [v for v in added_var_ids if v in sanitized]
+                if len(contained_in) == 1:
+                    return contained_in[0]
+                return sanitized  # fallback to exact sanitized form
+
+            # Add edges with full evidence metadata
             edges_added = 0
             for edge in edges:
                 try:
-                    # Sanitize edge variable references the same way
-                    from_id = _re.sub(r'[^a-z0-9]+', '_', edge.from_var.lower()).strip('_')
-                    to_id = _re.sub(r'[^a-z0-9]+', '_', edge.to_var.lower()).strip('_')
+                    # Sanitize edge variable references and resolve via fuzzy matching
+                    from_id = _resolve_var_id(edge.from_var)
+                    to_id = _resolve_var_id(edge.to_var)
                     _logger.info("Attempting edge: %s → %s (raw: %s → %s)",
                                  from_id, to_id, edge.from_var, edge.to_var)
                     engine.add_edge(
@@ -263,6 +375,11 @@ Respond with a JSON array of edges:
                         to_var=to_id,
                         mechanism=edge.mechanism,
                         strength=edge.strength,
+                        evidence_refs=edge.evidence_bundle_ids or None,
+                        confidence=edge.confidence,
+                        assumptions=edge.assumptions or None,
+                        conditions=edge.conditions or None,
+                        contradicting_refs=edge.contradicting_bundle_ids or None,
                     )
                     edges_added += 1
                 except Exception as _edge_err:
@@ -270,7 +387,29 @@ Respond with a JSON array of edges:
                     continue
 
             _logger.info("Added %d/%d edges to engine", edges_added, len(edges))
-            
+
+            # Stage 4.5: Post-build conflict detection (Phase 3)
+            all_evidence = list(self._evidence_cache.values())
+            conflict_report = self.causal.detect_conflicts(
+                fresh_evidence=all_evidence,
+                domain=domain,
+            )
+            if conflict_report.total > 0:
+                # Auto-resolve non-critical conflicts
+                actions = self.causal.resolve_conflicts(conflict_report)
+                self.causal.apply_resolutions(actions, domain=domain)
+                audit_entries.append(self._create_audit(
+                    trace_id, "conflict_detection_complete",
+                    {
+                        "total": conflict_report.total,
+                        "critical": conflict_report.critical_count,
+                        "resolved": len(actions),
+                    }
+                ))
+            conflicts_detected = conflict_report.total
+            critical_conflicts = conflict_report.critical_count
+            conflict_details = [c.to_dict() for c in conflict_report.conflicts]
+
             # Stage 5: Human Review
             self._current_stage = Mode1Stage.HUMAN_REVIEW
             world_model = engine.to_world_model(domain, f"World model for {domain}")
@@ -292,6 +431,9 @@ Respond with a JSON array of edges:
                 evidence_linked=len(self._evidence_cache),
                 audit_entries=audit_entries,
                 requires_review=True,
+                conflicts_detected=conflicts_detected,
+                critical_conflicts=critical_conflicts,
+                conflict_details=conflict_details,
             )
             
         except Exception as e:
@@ -309,9 +451,15 @@ Respond with a JSON array of edges:
         query: str,
         max_variables: int,
     ) -> list[VariableCandidate]:
-        """Discover causal variables from evidence."""
-        # Retrieve initial evidence
-        evidence = await self.retrieval.retrieve_simple(query, max_results=10)
+        """Discover causal variables from evidence using hybrid retrieval."""
+        # Phase 2: use hybrid retrieval for better recall
+        request = RetrievalRequest(
+            query=query,
+            strategy=RetrievalStrategy.HYBRID,
+            max_results=10,
+            use_reranking=True,
+        )
+        evidence = await self.retrieval.retrieve(request)
         
         # Cache evidence
         for e in evidence:
@@ -320,7 +468,7 @@ Respond with a JSON array of edges:
         # Use LLM to identify variables
         evidence_text = "\n\n".join([
             f"[{e.content_hash[:8]}] {e.content[:500]}"
-            for e in evidence[:5]
+            for e in evidence[:10]
         ])
         
         prompt = self.VARIABLE_DISCOVERY_PROMPT.format(
@@ -328,11 +476,61 @@ Respond with a JSON array of edges:
             evidence=evidence_text,
         )
         
-        response = await self.llm.generate(prompt)
+        response = await self.llm.generate(prompt, temperature=0.3)
         _logger.info("Variable discovery: LLM returned %d chars", len(response.content))
 
         # Parse variables from response
         variables = self._parse_variables(response.content)
+
+        # If too few variables found, retry with broader evidence and more explicit prompt
+        if len(variables) < 7 and len(evidence) >= 3:
+            _logger.info("Only %d variables found, retrying with broader evidence", len(variables))
+            # Get additional evidence with a different query angle
+            broader_query = f"factors costs revenue quality operations competition in {domain}"
+            broader_request = RetrievalRequest(
+                query=broader_query,
+                strategy=RetrievalStrategy.HYBRID,
+                max_results=10,
+                use_reranking=True,
+            )
+            broader_evidence = await self.retrieval.retrieve(broader_request)
+            # Merge evidence
+            all_evidence = list(evidence)
+            seen_hashes = {e.content_hash for e in evidence}
+            for e in broader_evidence:
+                if e.content_hash not in seen_hashes:
+                    all_evidence.append(e)
+                    seen_hashes.add(e.content_hash)
+                    self._evidence_cache[e.content_hash[:12]] = e
+
+            broader_text = "\n\n".join([
+                f"[{e.content_hash[:8]}] {e.content[:500]}"
+                for e in all_evidence[:15]
+            ])
+            existing_names = [v.name for v in variables]
+            retry_prompt = (
+                f"I already found these variables: {existing_names}\n"
+                f"But there are MANY more causal factors in this evidence.\n\n"
+                f"Evidence:\n{broader_text}\n\n"
+                f"List ALL additional measurable variables from this evidence for "
+                f"a causal model of '{domain}'. Look for EVERY factor mentioned — "
+                f"costs, revenue, quality, satisfaction, traffic, location, marketing, "
+                f"competition, pricing, training, staffing, operations, etc.\n\n"
+                f"Return a JSON array of at least 6 NEW variables (not: {existing_names}):\n"
+                f'[{{"variable_id": "...", "name": "...", "description": "...", '
+                f'"type": "continuous|discrete|binary|categorical", '
+                f'"measurement_status": "measured|observable|latent"}}]'
+            )
+            retry_response = await self.llm.generate(retry_prompt, temperature=0.3)
+            retry_variables = self._parse_variables(retry_response.content)
+            # Merge: keep new ones not already in the set
+            existing_names = {v.name.lower() for v in variables}
+            for rv in retry_variables:
+                if rv.name.lower() not in existing_names:
+                    variables.append(rv)
+                    existing_names.add(rv.name.lower())
+            _logger.info("After retry: %d variables", len(variables))
+
         _logger.info("Parsed %d variables: %s",
                      len(variables), [v.name for v in variables])
 
@@ -343,12 +541,19 @@ Respond with a JSON array of edges:
         self,
         variables: list[VariableCandidate],
     ) -> dict[str, list[EvidenceBundle]]:
-        """Gather additional evidence for each variable."""
+        """Gather additional evidence for each variable using hybrid retrieval."""
         evidence_map: dict[str, list[EvidenceBundle]] = {}
         
         for var in variables:
             query = f"{var.name}: {var.description}"
-            bundles = await self.retrieval.retrieve_simple(query, max_results=3)
+            # Phase 2: use hybrid retrieval with re-ranking
+            request = RetrievalRequest(
+                query=query,
+                strategy=RetrievalStrategy.HYBRID,
+                max_results=3,
+                use_reranking=True,
+            )
+            bundles = await self.retrieval.retrieve(request)
             
             evidence_map[var.name] = bundles
             
@@ -364,28 +569,218 @@ Respond with a JSON array of edges:
         variables: list[VariableCandidate],
         max_edges: int,
     ) -> list[EdgeCandidate]:
-        """Draft causal DAG structure using LLM."""
+        """
+        Draft causal DAG structure using PyWhyLLM bridge + evidence-grounded LLM.
+
+        Two-stage approach:
+        1. PyWhyLLM bridge proposes edges via pairwise relationship analysis
+        2. Evidence-grounded LLM prompt fills in any gaps with explicit evidence citations
+
+        Every edge MUST reference at least one evidence bundle.
+        """
         import re as _re
+
+        var_ids = [
+            _re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')
+            for v in variables
+        ]
+        # Remove empty / duplicate ids
+        var_ids = list(dict.fromkeys(vid for vid in var_ids if vid))
+
+        # Build evidence map keyed by variable ID
+        evidence_by_var: dict[str, list[EvidenceBundle]] = {}
+        for var in variables:
+            var_id = _re.sub(r'[^a-z0-9]+', '_', var.name.lower()).strip('_')
+            if not var_id:
+                continue
+            # Gather all evidence mentioning this variable
+            matching = [
+                eb for eb in self._evidence_cache.values()
+                if var.name.lower() in eb.content.lower()
+                or var_id in eb.content.lower()
+            ]
+            evidence_by_var[var_id] = matching
+
+        # ── Stage A: PyWhyLLM bridge ──────────────────────────────────
+        bridge_result: BridgeResult = self.bridge.build_graph_from_evidence(
+            domain=domain,
+            variables=var_ids,
+            evidence_bundles=evidence_by_var,
+        )
+        _logger.info(
+            "PyWhyLLM bridge proposed %d edges, %d confounder suggestions",
+            len(bridge_result.edge_proposals),
+            len(bridge_result.confounder_suggestions),
+        )
+
+        edges: list[EdgeCandidate] = []
+        seen_pairs: set[tuple[str, str]] = set()
+
+        for proposal in bridge_result.edge_proposals:
+            if (proposal.from_var, proposal.to_var) in seen_pairs:
+                continue
+            seen_pairs.add((proposal.from_var, proposal.to_var))
+            edges.append(EdgeCandidate(
+                from_var=proposal.from_var,
+                to_var=proposal.to_var,
+                mechanism=proposal.mechanism,
+                strength=proposal.strength,
+                evidence_refs=proposal.supporting_evidence,
+                contradicting_refs=proposal.contradicting_evidence,
+                assumptions=proposal.assumptions,
+                confidence=proposal.confidence,
+            ))
+
+        # ── Stage B: Evidence-grounded LLM prompt ─────────────────────
+        # Supplement with LLM-proposed edges grounded in evidence text
         variables_text = "\n".join([
             f"- {_re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')}: {v.description}"
             for v in variables
         ])
-        
-        prompt = self.DAG_DRAFTING_PROMPT.format(
+
+        evidence_text = "\n\n".join([
+            f"[{eb.content_hash[:8]}] (Source: {eb.source.doc_title}) {eb.content[:400]}"
+            for eb in list(self._evidence_cache.values())[:15]
+        ])
+
+        # Build a list of example pairs to guide the LLM
+        import itertools as _itertools
+        example_pairs = list(_itertools.combinations(var_ids[:8], 2))[:15]
+        pairs_text = "\n".join(
+            f"  - Does {a} cause or affect {b} (or vice versa)?"
+            for a, b in example_pairs
+        )
+
+        prompt = self.EVIDENCE_GROUNDED_DAG_PROMPT.format(
             domain=domain,
             variables=variables_text,
+            evidence=evidence_text,
         )
-        
-        response = await self.llm.generate(prompt)
-        _logger.info("DAG draft LLM response (%d chars): %.300s...",
-                     len(response.content), response.content)
+        # Append pair suggestions to help the LLM be thorough
+        prompt += (
+            f"\n\nHere are some variable pairs to consider "
+            f"(check ALL of them for causal links):\n{pairs_text}\n\n"
+            f"Return ALL edges you find — aim for at least "
+            f"{max(3, len(var_ids) - 2)} edges for {len(var_ids)} variables."
+        )
 
-        # Parse edges from response
-        edges = self._parse_edges(response.content)
-        _logger.info("DAG draft: parsed %d edges from LLM response", len(edges))
-        for e in edges:
-            _logger.info("  Edge: %s → %s (%s)", e.from_var, e.to_var, e.mechanism[:60])
-        
+        response = await self.llm.generate(prompt)
+        _logger.info("Evidence-grounded DAG LLM response (%d chars)", len(response.content))
+
+        llm_edges = self._parse_edges(response.content)
+        for e in llm_edges:
+            pair = (e.from_var, e.to_var)
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                edges.append(e)
+
+        # Retry once if LLM returned too few edges relative to variable count.
+        # Use a focused batch prompt listing uncovered variable pairs explicitly.
+        min_expected = max(2, len(var_ids) // 2)
+        if len(edges) < min_expected and len(var_ids) >= 4:
+            _logger.info(
+                "Only %d edges for %d variables (expected >= %d), retrying with batch pairwise prompt",
+                len(edges), len(var_ids), min_expected,
+            )
+            existing_edges_text = "\n".join(
+                f"  - {e.from_var} → {e.to_var}" for e in edges
+            )
+            # Identify uncovered pairs — variables not yet connected
+            connected = set()
+            for e in edges:
+                connected.add(e.from_var)
+                connected.add(e.to_var)
+            uncovered = [v for v in var_ids if v not in connected]
+            # Build pairs between connected and uncovered variables
+            retry_pairs = []
+            for u in uncovered[:6]:
+                for c in list(connected)[:4]:
+                    retry_pairs.append((c, u))
+            if not retry_pairs:
+                # Fallback: all pairs not already covered
+                for a, b in _itertools.combinations(var_ids[:8], 2):
+                    if (a, b) not in seen_pairs and (b, a) not in seen_pairs:
+                        retry_pairs.append((a, b))
+            retry_pairs = retry_pairs[:12]
+
+            pairs_to_check = "\n".join(
+                f"  - {a} → {b}?" for a, b in retry_pairs
+            )
+            retry_prompt = (
+                f"You already found these edges:\n{existing_edges_text}\n\n"
+                f"Domain: {domain}\n\n"
+                f"Evidence:\n{evidence_text}\n\n"
+                f"Check each of these specific pairs for causal relationships "
+                f"supported by the evidence above:\n{pairs_to_check}\n\n"
+                f"For each pair where the evidence supports a causal link, "
+                f"add it to the result. Return ONLY a JSON array:\n"
+                f'[{{"from_var": "...", "to_var": "...", "mechanism": "...", '
+                f'"strength": "hypothesis|moderate|strong", "evidence_ids": [...], '
+                f'"assumptions": [...]}}]'
+            )
+            retry_response = await self.llm.generate(retry_prompt)
+            _logger.info("DAG retry response (%d chars)", len(retry_response.content))
+            retry_edges = self._parse_edges(retry_response.content)
+            for e in retry_edges:
+                pair = (e.from_var, e.to_var)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    edges.append(e)
+            _logger.info("After batch retry: %d total edges", len(edges))
+
+        # If STILL too few edges, try individual pairwise prompts for high-priority pairs
+        if len(edges) < min_expected and len(var_ids) >= 4:
+            connected = set()
+            for e in edges:
+                connected.add(e.from_var)
+                connected.add(e.to_var)
+            uncovered = [v for v in var_ids if v not in connected]
+            pairwise_to_try = []
+            for u in uncovered[:5]:
+                for c in list(connected)[:3]:
+                    if (c, u) not in seen_pairs and (u, c) not in seen_pairs:
+                        pairwise_to_try.append((c, u))
+            # Also add some uncovered-uncovered pairs
+            for i, u1 in enumerate(uncovered[:4]):
+                for u2 in uncovered[i+1:i+3]:
+                    if (u1, u2) not in seen_pairs and (u2, u1) not in seen_pairs:
+                        pairwise_to_try.append((u1, u2))
+
+            _logger.info("Trying %d individual pairwise prompts", len(pairwise_to_try[:8]))
+            for a, b in pairwise_to_try[:8]:
+                pair_prompt = (
+                    f"Given this evidence:\n{evidence_text[:1500]}\n\n"
+                    f"Is there a causal relationship between '{a}' and '{b}'? "
+                    f"If yes, return a JSON object: "
+                    f'{{"from_var": "cause_id", "to_var": "effect_id", '
+                    f'"mechanism": "...", "strength": "hypothesis|moderate|strong"}}\n'
+                    f"If no, return: {{}}"
+                )
+                try:
+                    pair_resp = await self.llm.generate(pair_prompt, temperature=0.2)
+                    pair_edges = self._parse_edges(pair_resp.content)
+                    for e in pair_edges:
+                        pair_key = (e.from_var, e.to_var)
+                        if pair_key not in seen_pairs and e.from_var and e.to_var:
+                            seen_pairs.add(pair_key)
+                            edges.append(e)
+                except Exception as _pair_err:
+                    _logger.warning("Pairwise prompt %s→%s failed: %s", a, b, _pair_err)
+            _logger.info("After pairwise prompts: %d total edges", len(edges))
+
+        _logger.info("DAG draft: %d total edges (%d from bridge, %d from LLM)",
+                     len(edges),
+                     len(bridge_result.edge_proposals),
+                     len(llm_edges))
+
+        # Apply variable role classifications from bridge
+        for vc in bridge_result.variable_classifications:
+            for var_cand in variables:
+                var_id = _re.sub(r'[^a-z0-9]+', '_', var_cand.name.lower()).strip('_')
+                if var_id == vc.variable_id:
+                    var_cand.role = vc.role
+                    break
+
         self._edge_candidates = edges[:max_edges]
         return self._edge_candidates
     
@@ -393,14 +788,68 @@ Respond with a JSON array of edges:
         self,
         edges: list[EdgeCandidate],
     ) -> None:
-        """Link evidence to edge candidates."""
+        """
+        Link evidence to edge candidates with support/contradiction search.
+
+        For each edge, searches for:
+        1. Supporting evidence: "X causes Y", "X affects Y"
+        2. Contradicting evidence: "X does not cause Y", "no relationship between X and Y"
+
+        Then classifies edge strength based on the balance of evidence.
+        """
         for edge in edges:
-            query = f"{edge.from_var} causes {edge.to_var}: {edge.mechanism}"
-            bundles = await self.retrieval.retrieve_simple(query, max_results=2)
-            
-            for b in bundles:
-                edge.evidence_refs.append(b.content_hash[:12])
-                self._evidence_cache[b.content_hash[:12]] = b
+            # ── Supporting evidence search ─────────────────────────────
+            support_query = f"{edge.from_var} causes {edge.to_var}: {edge.mechanism}"
+            support_bundles = await self.retrieval.retrieve_simple(support_query, max_results=3)
+
+            for b in support_bundles:
+                hash_prefix = b.content_hash[:12]
+                if hash_prefix not in edge.evidence_refs:
+                    edge.evidence_refs.append(hash_prefix)
+                    edge.evidence_bundle_ids.append(b.bundle_id)
+                self._evidence_cache[hash_prefix] = b
+
+            # ── Contradicting evidence search ──────────────────────────
+            contradict_query = (
+                f"{edge.from_var} does not cause {edge.to_var} OR "
+                f"no relationship between {edge.from_var} and {edge.to_var}"
+            )
+            contra_bundles = await self.retrieval.retrieve_simple(contradict_query, max_results=2)
+
+            for b in contra_bundles:
+                hash_prefix = b.content_hash[:12]
+                # Only count as contradicting if the content actually
+                # mentions the relationship negation (simple heuristic)
+                content_lower = b.content.lower()
+                negation_signals = ["not cause", "no effect", "no relationship",
+                                     "does not affect", "no significant",
+                                     "no evidence", "contrary"]
+                is_contradicting = any(sig in content_lower for sig in negation_signals)
+
+                if is_contradicting and hash_prefix not in edge.contradicting_refs:
+                    edge.contradicting_refs.append(hash_prefix)
+                    edge.contradicting_bundle_ids.append(b.bundle_id)
+                elif hash_prefix not in edge.evidence_refs:
+                    # If retrieved but not actually contradicting, count as support
+                    edge.evidence_refs.append(hash_prefix)
+                    edge.evidence_bundle_ids.append(b.bundle_id)
+
+                self._evidence_cache[hash_prefix] = b
+
+            # ── Classify edge strength ─────────────────────────────────
+            strength, confidence = CausalGraphBridge.classify_edge_strength(
+                supporting_count=len(edge.evidence_refs),
+                contradicting_count=len(edge.contradicting_refs),
+            )
+            edge.strength = strength
+            edge.confidence = confidence
+
+            _logger.info(
+                "Edge %s→%s: %d supporting, %d contradicting → %s (%.2f)",
+                edge.from_var, edge.to_var,
+                len(edge.evidence_refs), len(edge.contradicting_refs),
+                strength.value, confidence,
+            )
     
     @staticmethod
     def _extract_json_array(content: str) -> list[dict]:
@@ -457,6 +906,24 @@ Respond with a JSON array of edges:
         if objects:
             return objects
 
+        # Strategy 5: repair truncated JSON arrays — close open strings,
+        # objects, and arrays so we can salvage complete items.
+        if start != -1:
+            fragment = content[start:]
+            # Try closing progressively
+            for repair in ['"}]', '"}]', '"}}]', '"]']:
+                try:
+                    parsed = json.loads(fragment + repair)
+                    if isinstance(parsed, list):
+                        # Only keep items that have at least from_var or source
+                        return [
+                            item for item in parsed
+                            if isinstance(item, dict)
+                            and (item.get("from_var") or item.get("source"))
+                        ]
+                except json.JSONDecodeError:
+                    continue
+
         return []
 
     def _parse_variables(self, content: str) -> list[VariableCandidate]:
@@ -479,13 +946,29 @@ Respond with a JSON array of edges:
         return variables
     
     def _parse_edges(self, content: str) -> list[EdgeCandidate]:
-        """Parse edges from LLM response."""
+        """Parse edges from LLM response, including evidence IDs and assumptions."""
         data = self._extract_json_array(content)
         if not data:
             return []
 
         edges = []
         for item in data:
+            # Accept both from_var/to_var and source/target naming conventions
+            from_var = (
+                item.get("from_var")
+                or item.get("source")
+                or item.get("cause")
+                or ""
+            ).strip()
+            to_var = (
+                item.get("to_var")
+                or item.get("target")
+                or item.get("effect")
+                or ""
+            ).strip()
+            # Skip edges with empty or missing variable IDs
+            if not from_var or not to_var:
+                continue
             strength_str = item.get("strength", "hypothesis").lower()
             strength_map = {
                 "strong": EvidenceStrength.STRONG,
@@ -493,11 +976,17 @@ Respond with a JSON array of edges:
                 "hypothesis": EvidenceStrength.HYPOTHESIS,
             }
 
+            # Parse evidence IDs if provided by evidence-grounded prompt
+            evidence_ids = item.get("evidence_ids", [])
+            assumptions = item.get("assumptions", [])
+
             edges.append(EdgeCandidate(
-                from_var=item.get("from_var", ""),
-                to_var=item.get("to_var", ""),
+                from_var=from_var,
+                to_var=to_var,
                 mechanism=item.get("mechanism", ""),
                 strength=strength_map.get(strength_str, EvidenceStrength.HYPOTHESIS),
+                evidence_refs=evidence_ids if isinstance(evidence_ids, list) else [],
+                assumptions=assumptions if isinstance(assumptions, list) else [],
             ))
         return edges
     

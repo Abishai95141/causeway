@@ -49,6 +49,17 @@ class MeasurementStatus(str, Enum):
     LATENT = "latent"          # Cannot directly observe
 
 
+class VariableRole(str, Enum):
+    """Causal role of a variable in a DAG."""
+    TREATMENT = "treatment"        # Manipulable intervention variable
+    OUTCOME = "outcome"            # Target outcome variable
+    CONFOUNDER = "confounder"      # Common cause of treatment and outcome
+    MEDIATOR = "mediator"          # On the causal path between treatment and outcome
+    INSTRUMENTAL = "instrumental"  # Affects treatment but not outcome directly
+    COVARIATE = "covariate"        # Other measured variable
+    UNKNOWN = "unknown"            # Role not yet classified
+
+
 class ConfidenceLevel(str, Enum):
     """Confidence level for recommendations."""
     HIGH = "high"

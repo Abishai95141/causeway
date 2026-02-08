@@ -4,10 +4,17 @@ Haystack Pipeline
 RAG pipeline using Haystack 2.x with Qdrant vector store.
 Provides semantic search over document chunks with proper
 sentence-aware splitting and document-level embedding.
+
+Phase 2 additions:
+- BM25 keyword scoring (mock and real)
+- Hybrid search with Reciprocal Rank Fusion (RRF)
+- Cross-encoder re-ranking
+- Score normalisation across retrieval methods
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from math import log
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -72,31 +79,52 @@ class HaystackPipeline:
 
     async def initialize(self) -> None:
         """Initialize the Haystack pipeline components."""
+        # Step 1: Check that all required packages are importable.
+        #         This is the ONLY place we should catch ImportError for
+        #         missing top-level packages.
         try:
-            from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
-            from haystack.components.embedders import (
+            from haystack_integrations.document_stores.qdrant import QdrantDocumentStore  # noqa: F401
+            from haystack.components.embedders import (                                   # noqa: F401
                 SentenceTransformersTextEmbedder,
                 SentenceTransformersDocumentEmbedder,
             )
-            from haystack.components.preprocessors import DocumentSplitter
-            from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
+            from haystack.components.preprocessors import DocumentSplitter               # noqa: F401
+            from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever  # noqa: F401
+        except ImportError as exc:
+            logger.warning("Haystack / Qdrant packages missing — mock mode (%s)", exc)
+            self._mock_mode = True
+            self._initialized = True
+            return
 
-            # Try to connect to Qdrant — fall back to mock on failure
-            try:
-                self._document_store = QdrantDocumentStore(
-                    host=self.qdrant_host,
-                    port=self.qdrant_port,
-                    index=self.collection_name,
-                    embedding_dim=384,  # MiniLM-L6-v2
-                    recreate_index=False,
-                )
-                self._document_store.count_documents()
-            except Exception:
-                logger.warning("Qdrant unavailable — falling back to mock mode")
-                self._mock_mode = True
-                self._initialized = True
-                return
+        # Step 2: Connect to Qdrant (separate from package availability)
+        from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+        from haystack.components.embedders import (
+            SentenceTransformersTextEmbedder,
+            SentenceTransformersDocumentEmbedder,
+        )
+        from haystack.components.preprocessors import DocumentSplitter
+        from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
 
+        try:
+            self._document_store = QdrantDocumentStore(
+                host=self.qdrant_host,
+                port=self.qdrant_port,
+                index=self.collection_name,
+                embedding_dim=384,  # MiniLM-L6-v2
+                recreate_index=False,
+            )
+            self._document_store.count_documents()
+        except Exception as exc:
+            logger.warning("Qdrant unavailable — falling back to mock mode: %s", exc)
+            self._mock_mode = True
+            self._initialized = True
+            return
+
+        # Step 3: Build pipeline components.
+        #         Errors here are REAL bugs (e.g. missing nltk) — do NOT
+        #         silently fall back; let them propagate so operators see
+        #         what actually broke.
+        try:
             # Sentence-aware splitter (replaces naive char chunking)
             self._splitter = DocumentSplitter(
                 split_by="sentence",
@@ -123,11 +151,13 @@ class HaystackPipeline:
             self._initialized = True
             self._mock_mode = False
             logger.info("Haystack pipeline initialised (Qdrant live)")
-
-        except ImportError:
-            logger.warning("Haystack / Qdrant packages missing — mock mode")
-            self._mock_mode = True
-            self._initialized = True
+        except Exception as exc:
+            logger.error(
+                "Pipeline component initialisation FAILED: %s  "
+                "(check that nltk, sentence-transformers, etc. are installed)",
+                exc,
+            )
+            raise
 
     # ------------------------------------------------------------------ #
     # Document indexing
@@ -257,6 +287,313 @@ class HaystackPipeline:
         ]
 
     # ------------------------------------------------------------------ #
+    # Hybrid Search (Phase 2)
+    # ------------------------------------------------------------------ #
+
+    async def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filters: Optional[dict[str, Any]] = None,
+        vector_weight: float = 0.5,
+        bm25_weight: float = 0.5,
+        rrf_k: int = 60,
+    ) -> list[ChunkResult]:
+        """
+        Hybrid search combining vector similarity and BM25 keyword matching.
+
+        Uses Reciprocal Rank Fusion (RRF) to merge rankings:
+            ``score(d) = Σ  weight_i / (k + rank_i(d))``
+
+        Args:
+            query:          Search query
+            top_k:          Number of results to return
+            filters:        Optional metadata filters
+            vector_weight:  Weight for vector retrieval (0-1)
+            bm25_weight:    Weight for BM25 retrieval (0-1)
+            rrf_k:          RRF smoothing constant (default 60)
+
+        Returns:
+            Fused and ranked chunk results with combined scores
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Retrieve from both pipelines (fetch extra candidates for fusion)
+        fetch_k = min(top_k * 3, 50)
+
+        vector_results = await self.search(query, top_k=fetch_k, filters=filters)
+        bm25_results = self._bm25_search(query, top_k=fetch_k, filters=filters)
+
+        # Build per-method rank maps  (chunk_id → 0-based rank)
+        vector_ranks: dict[str, int] = {
+            r.chunk_id: i for i, r in enumerate(vector_results)
+        }
+        bm25_ranks: dict[str, int] = {
+            r.chunk_id: i for i, r in enumerate(bm25_results)
+        }
+
+        # Collect all candidate chunk_ids
+        all_ids = set(vector_ranks.keys()) | set(bm25_ranks.keys())
+
+        # Lookup table for the actual ChunkResult objects
+        chunk_map: dict[str, ChunkResult] = {}
+        for r in vector_results:
+            chunk_map[r.chunk_id] = r
+        for r in bm25_results:
+            if r.chunk_id not in chunk_map:
+                chunk_map[r.chunk_id] = r
+
+        # RRF fusion
+        fused: list[tuple[str, float, dict[str, float]]] = []
+        for cid in all_ids:
+            score = 0.0
+            component_scores: dict[str, float] = {}
+
+            if cid in vector_ranks:
+                v_score = vector_weight / (rrf_k + vector_ranks[cid])
+                score += v_score
+                component_scores["vector"] = vector_results[vector_ranks[cid]].score
+
+            if cid in bm25_ranks:
+                b_score = bm25_weight / (rrf_k + bm25_ranks[cid])
+                score += b_score
+                component_scores["bm25"] = bm25_results[bm25_ranks[cid]].score
+
+            fused.append((cid, score, component_scores))
+
+        # Sort by fused score descending
+        fused.sort(key=lambda t: t[1], reverse=True)
+
+        results: list[ChunkResult] = []
+        for cid, fused_score, comp in fused[:top_k]:
+            base = chunk_map[cid]
+            results.append(ChunkResult(
+                chunk_id=base.chunk_id,
+                content=base.content,
+                score=round(fused_score, 6),
+                doc_id=base.doc_id,
+                metadata={
+                    **base.metadata,
+                    "retrieval_method": "hybrid",
+                    "vector_score": comp.get("vector", 0.0),
+                    "bm25_score": comp.get("bm25", 0.0),
+                },
+            ))
+
+        return results
+
+    # ------------------------------------------------------------------ #
+    # BM25 search (keyword / lexical)
+    # ------------------------------------------------------------------ #
+
+    def _bm25_search(
+        self,
+        query: str,
+        top_k: int = 10,
+        filters: Optional[dict[str, Any]] = None,
+        k1: float = 1.5,
+        b: float = 0.75,
+    ) -> list[ChunkResult]:
+        """
+        BM25 keyword search over stored chunks.
+
+        Uses Okapi BM25 scoring with IDF weighting.
+
+        Args:
+            query:   Search query
+            top_k:   Number of results
+            filters: Optional metadata filters
+            k1:      Term frequency saturation parameter
+            b:       Length normalisation parameter
+
+        Returns:
+            Ranked chunk results with BM25 scores
+        """
+        query_terms = self._tokenize(query)
+        if not query_terms:
+            return []
+
+        # Gather candidate chunks from available source
+        if self._mock_mode:
+            chunks = list(self._mock_chunks.values())
+        elif self._document_store:
+            # In real mode, pull all documents from Qdrant for BM25 scoring.
+            # Build Qdrant filter if doc_id filter is provided.
+            qdrant_filters = None
+            if filters and filters.get("doc_id"):
+                qdrant_filters = {
+                    "operator": "AND",
+                    "conditions": [
+                        {
+                            "field": "meta.doc_id",
+                            "operator": "==",
+                            "value": filters["doc_id"],
+                        }
+                    ],
+                }
+            try:
+                haystack_docs = self._document_store.filter_documents(
+                    filters=qdrant_filters,
+                )
+                chunks = [
+                    ChunkResult(
+                        chunk_id=d.id or "",
+                        content=d.content or "",
+                        score=0.0,
+                        doc_id=d.meta.get("doc_id", ""),
+                        metadata=d.meta,
+                    )
+                    for d in haystack_docs
+                ]
+            except Exception as exc:
+                logger.warning("BM25: could not fetch docs from Qdrant: %s", exc)
+                chunks = []
+        else:
+            chunks = []
+
+        if not chunks:
+            return []
+
+        # Apply filters (mock mode only — real mode already filtered in Qdrant)
+        if self._mock_mode and filters:
+            doc_id_filter = filters.get("doc_id")
+            if doc_id_filter:
+                chunks = [c for c in chunks if c.doc_id == doc_id_filter]
+
+        N = len(chunks)
+        if N == 0:
+            return []
+
+        doc_lengths: dict[str, int] = {}
+        doc_term_freq: dict[str, dict[str, int]] = {}
+        for chunk in chunks:
+            tokens = self._tokenize(chunk.content)
+            doc_lengths[chunk.chunk_id] = len(tokens)
+            tf: dict[str, int] = {}
+            for t in tokens:
+                tf[t] = tf.get(t, 0) + 1
+            doc_term_freq[chunk.chunk_id] = tf
+
+        avgdl = sum(doc_lengths.values()) / N if N else 1.0
+
+        # IDF for query terms
+        idf: dict[str, float] = {}
+        for term in query_terms:
+            df = sum(1 for tf in doc_term_freq.values() if term in tf)
+            idf[term] = log((N - df + 0.5) / (df + 0.5) + 1.0)
+
+        # Score each document
+        scored: list[tuple[ChunkResult, float]] = []
+        for chunk in chunks:
+            score = 0.0
+            dl = doc_lengths[chunk.chunk_id]
+            tf_map = doc_term_freq[chunk.chunk_id]
+            for term in query_terms:
+                tf_val = tf_map.get(term, 0)
+                if tf_val > 0:
+                    numerator = tf_val * (k1 + 1)
+                    denominator = tf_val + k1 * (1 - b + b * dl / avgdl)
+                    score += idf.get(term, 0.0) * numerator / denominator
+            if score > 0:
+                scored.append((chunk, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        return [
+            ChunkResult(
+                chunk_id=chunk.chunk_id,
+                content=chunk.content,
+                score=round(score, 6),
+                doc_id=chunk.doc_id,
+                metadata={**chunk.metadata, "retrieval_method": "bm25"},
+            )
+            for chunk, score in scored[:top_k]
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Re-ranking (Phase 2)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def rerank(
+        query: str,
+        results: list[ChunkResult],
+        top_k: int = 5,
+    ) -> list[ChunkResult]:
+        """
+        Re-rank results using heuristic relevance scoring.
+
+        Uses query-term coverage, density, and proximity as a stand-in
+        for a real cross-encoder model.
+
+        Args:
+            query:   Original query
+            results: Candidate results from initial retrieval
+            top_k:   How many to keep after re-ranking
+
+        Returns:
+            Re-ranked (and possibly pruned) chunk results
+        """
+        if not results:
+            return []
+
+        query_terms = set(query.lower().split())
+        scored: list[tuple[ChunkResult, float]] = []
+
+        for rank, chunk in enumerate(results):
+            content_lower = chunk.content.lower()
+            words = content_lower.split()
+            word_count = max(len(words), 1)
+
+            # Term coverage: fraction of query terms found in chunk
+            matched_terms = sum(1 for t in query_terms if t in content_lower)
+            term_coverage = matched_terms / max(len(query_terms), 1)
+
+            # Term density: how concentrated the query terms are
+            term_hits = sum(1 for w in words if w in query_terms)
+            density = term_hits / word_count
+
+            # Proximity bonus: how close query terms appear to each other
+            positions = [i for i, w in enumerate(words) if w in query_terms]
+            proximity = 0.0
+            if len(positions) >= 2:
+                spans = [positions[i + 1] - positions[i] for i in range(len(positions) - 1)]
+                avg_span = sum(spans) / len(spans)
+                proximity = 1.0 / (1.0 + avg_span)
+
+            # Combine signals
+            rerank_score = (
+                0.4 * term_coverage
+                + 0.3 * density
+                + 0.2 * proximity
+                + 0.1 * chunk.score  # original retrieval score
+            )
+            scored.append((chunk, rerank_score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        return [
+            ChunkResult(
+                chunk_id=c.chunk_id,
+                content=c.content,
+                score=round(s, 6),
+                doc_id=c.doc_id,
+                metadata={**c.metadata, "reranked": True},
+            )
+            for c, s in scored[:top_k]
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Tokenisation helper
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Simple whitespace + lowercasing tokenizer for BM25."""
+        return [w for w in re.sub(r'[^\w\s]', ' ', text.lower()).split() if len(w) > 1]
+
+    # ------------------------------------------------------------------ #
     # Delete
     # ------------------------------------------------------------------ #
 
@@ -273,7 +610,9 @@ class HaystackPipeline:
             return len(to_delete)
 
         if self._document_store:
-            self._document_store.delete_documents(
+            # QdrantDocumentStore.delete_documents expects a list of doc IDs.
+            # Filter by metadata first, collect matching IDs, then delete.
+            matching = self._document_store.filter_documents(
                 filters={
                     "operator": "AND",
                     "conditions": [
@@ -285,7 +624,12 @@ class HaystackPipeline:
                     ],
                 }
             )
-        return 0  # Qdrant doesn't return count
+            if matching:
+                ids_to_delete = [d.id for d in matching if d.id]
+                if ids_to_delete:
+                    self._document_store.delete_documents(ids_to_delete)
+                return len(ids_to_delete)
+        return 0
 
     # ------------------------------------------------------------------ #
     # Mock helpers
@@ -469,4 +813,11 @@ class HaystackPipeline:
 
     @property
     def chunk_count(self) -> int:
-        return len(self._mock_chunks)
+        if self._mock_mode:
+            return len(self._mock_chunks)
+        if self._document_store:
+            try:
+                return self._document_store.count_documents()
+            except Exception:
+                return 0
+        return 0

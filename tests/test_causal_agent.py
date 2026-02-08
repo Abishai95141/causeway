@@ -23,7 +23,7 @@ from src.causal.service import CausalService
 from src.agent.llm_client import LLMClient, LLMModel
 from src.agent.context_manager import ContextManager, MessageRole
 from src.agent.orchestrator import AgentOrchestrator
-from src.models.enums import EvidenceStrength, ModelStatus, VariableType, MeasurementStatus
+from src.models.enums import EvidenceStrength, ModelStatus, VariableType, MeasurementStatus, VariableRole
 
 
 class TestDAGEngine:
@@ -145,6 +145,187 @@ class TestDAGEngine:
         
         assert new_engine.node_count == 2
         assert new_engine.edge_count == 1
+
+
+class TestDAGEnginePhase1:
+    """Test Phase 1 extensions: variable roles, edge assumptions, conditions, contradictions."""
+
+    @pytest.fixture
+    def engine(self):
+        return DAGEngine()
+
+    def test_add_variable_with_role(self, engine):
+        """Should accept a VariableRole for the variable."""
+        var = engine.add_variable(
+            "price", "Price", "Product price",
+            role=VariableRole.TREATMENT,
+        )
+        assert var.role == VariableRole.TREATMENT
+
+    def test_add_variable_default_role_is_unknown(self, engine):
+        """Default role should be UNKNOWN."""
+        var = engine.add_variable("x", "X", "Variable X")
+        assert var.role == VariableRole.UNKNOWN
+
+    def test_add_edge_with_assumptions(self, engine):
+        """Should store assumptions on the edge metadata."""
+        engine.add_variable("a", "A", "Variable A")
+        engine.add_variable("b", "B", "Variable B")
+
+        edge = engine.add_edge(
+            "a", "b", "A causes B",
+            assumptions=["No unmeasured confounders", "Temporal ordering"],
+        )
+        assert edge.metadata.assumptions == ["No unmeasured confounders", "Temporal ordering"]
+
+    def test_add_edge_with_conditions(self, engine):
+        """Should store conditions on the edge metadata."""
+        engine.add_variable("a", "A", "Variable A")
+        engine.add_variable("b", "B", "Variable B")
+
+        edge = engine.add_edge(
+            "a", "b", "A causes B",
+            conditions=["Only in US market", "When demand > 100"],
+        )
+        assert edge.metadata.conditions == ["Only in US market", "When demand > 100"]
+
+    def test_add_edge_with_contradicting_refs(self, engine):
+        """Should store contradicting evidence refs on the edge metadata."""
+        engine.add_variable("a", "A", "Variable A")
+        engine.add_variable("b", "B", "Variable B")
+
+        contra_id = uuid4()
+        edge = engine.add_edge(
+            "a", "b", "A causes B",
+            contradicting_refs=[contra_id],
+        )
+        assert contra_id in edge.metadata.contradicting_refs
+
+    def test_add_edge_with_confidence(self, engine):
+        """Should store confidence score on the edge."""
+        engine.add_variable("a", "A", "Variable A")
+        engine.add_variable("b", "B", "Variable B")
+
+        edge = engine.add_edge(
+            "a", "b", "A causes B",
+            confidence=0.85,
+        )
+        assert edge.metadata.confidence == 0.85
+
+    def test_add_edge_all_phase1_fields(self, engine):
+        """Should handle all Phase 1 fields together."""
+        engine.add_variable("price", "Price", "Product price", role=VariableRole.TREATMENT)
+        engine.add_variable("demand", "Demand", "Customer demand", role=VariableRole.OUTCOME)
+
+        ev_id = uuid4()
+        contra_id = uuid4()
+        edge = engine.add_edge(
+            "price", "demand", "Price elasticity",
+            strength=EvidenceStrength.MODERATE,
+            evidence_refs=[ev_id],
+            confidence=0.72,
+            assumptions=["No unmeasured confounders"],
+            conditions=["US market only"],
+            contradicting_refs=[contra_id],
+        )
+
+        assert edge.from_var == "price"
+        assert edge.to_var == "demand"
+        assert edge.metadata.evidence_strength == EvidenceStrength.MODERATE
+        assert ev_id in edge.metadata.evidence_refs
+        assert contra_id in edge.metadata.contradicting_refs
+        assert edge.metadata.assumptions == ["No unmeasured confounders"]
+        assert edge.metadata.conditions == ["US market only"]
+        assert edge.metadata.confidence == 0.72
+
+    def test_to_world_model_preserves_roles(self, engine):
+        """WorldModelVersion serialization should preserve variable roles."""
+        engine.add_variable("price", "Price", "Price", role=VariableRole.TREATMENT)
+        engine.add_variable("demand", "Demand", "Demand", role=VariableRole.OUTCOME)
+        engine.add_edge("price", "demand", "Price affects demand")
+
+        model = engine.to_world_model("test", "Test model")
+        new_engine = DAGEngine.from_world_model(model)
+
+        variables_by_id = {v.variable_id: v for v in new_engine.variables}
+        assert variables_by_id["price"].role == VariableRole.TREATMENT
+        assert variables_by_id["demand"].role == VariableRole.OUTCOME
+
+    def test_to_world_model_preserves_edge_metadata(self, engine):
+        """WorldModelVersion serialization should preserve edge assumptions and conditions."""
+        engine.add_variable("a", "A", "Variable A")
+        engine.add_variable("b", "B", "Variable B")
+
+        contra_id = uuid4()
+        engine.add_edge(
+            "a", "b", "A causes B",
+            assumptions=["Assumption 1"],
+            conditions=["Condition 1"],
+            contradicting_refs=[contra_id],
+            confidence=0.65,
+        )
+
+        model = engine.to_world_model("test", "Test model")
+        new_engine = DAGEngine.from_world_model(model)
+
+        edges = new_engine.edges
+        assert len(edges) == 1
+        assert edges[0].metadata.assumptions == ["Assumption 1"]
+        assert edges[0].metadata.conditions == ["Condition 1"]
+        assert contra_id in edges[0].metadata.contradicting_refs
+        assert edges[0].metadata.confidence == 0.65
+
+
+class TestCausalServicePhase1:
+    """Test Phase 1 CausalService extensions."""
+
+    @pytest.fixture
+    def service(self):
+        svc = CausalService()
+        svc.create_world_model("test")
+        return svc
+
+    def test_add_variable_with_role(self, service):
+        """CausalService.add_variable should pass role through."""
+        var = service.add_variable(
+            "price", "Price", "Product price",
+            role=VariableRole.TREATMENT,
+        )
+        assert var.role == VariableRole.TREATMENT
+
+    def test_add_causal_link_with_assumptions(self, service):
+        """CausalService.add_causal_link should pass assumptions through."""
+        service.add_variable("a", "A", "Variable A")
+        service.add_variable("b", "B", "Variable B")
+
+        edge = service.add_causal_link(
+            "a", "b", "A causes B",
+            assumptions=["No confounders"],
+        )
+        assert edge.metadata.assumptions == ["No confounders"]
+
+    def test_add_causal_link_with_conditions(self, service):
+        """CausalService.add_causal_link should pass conditions through."""
+        service.add_variable("a", "A", "Variable A")
+        service.add_variable("b", "B", "Variable B")
+
+        edge = service.add_causal_link(
+            "a", "b", "A causes B",
+            conditions=["US market"],
+        )
+        assert edge.metadata.conditions == ["US market"]
+
+    def test_add_causal_link_with_contradicting_refs(self, service):
+        """CausalService.add_causal_link should pass contradicting_refs through."""
+        service.add_variable("a", "A", "Variable A")
+        service.add_variable("b", "B", "Variable B")
+
+        contra_id = uuid4()
+        edge = service.add_causal_link(
+            "a", "b", "A causes B",
+            contradicting_refs=[contra_id],
+        )
+        assert contra_id in edge.metadata.contradicting_refs
 
 
 class TestCausalPathFinder:

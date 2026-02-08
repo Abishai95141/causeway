@@ -124,22 +124,26 @@ class TestHaystackPipeline:
     """Test Haystack pipeline in mock mode."""
     
     @pytest.fixture
-    def pipeline(self):
-        """Create pipeline."""
-        return HaystackPipeline()
+    async def pipeline(self):
+        """Create pipeline and clean up afterwards."""
+        p = HaystackPipeline()
+        await p.initialize()
+        yield p
+        # Cleanup: delete any test documents left behind
+        for doc_id in ("doc1", "to_delete", "test"):
+            try:
+                await p.delete_document(doc_id)
+            except Exception:
+                pass
     
     @pytest.mark.asyncio
     async def test_initialize_mock_mode(self, pipeline):
-        """Should initialize in mock mode without dependencies."""
-        await pipeline.initialize()
+        """Should initialize without error."""
         assert pipeline._initialized
-        # Will be in mock mode if haystack_integrations not installed
     
     @pytest.mark.asyncio
     async def test_add_document_creates_chunks(self, pipeline):
         """Should chunk document and store."""
-        await pipeline.initialize()
-        
         chunk_ids = await pipeline.add_document(
             doc_id="doc1",
             content="This is test content. " * 100,  # ~2000 chars
@@ -152,17 +156,17 @@ class TestHaystackPipeline:
     @pytest.mark.asyncio
     async def test_search_returns_results(self, pipeline):
         """Should search and return ranked chunks."""
-        await pipeline.initialize()
-        
         await pipeline.add_document(
             doc_id="doc1",
             content="Pricing decisions affect revenue significantly. "
                     "Customer churn increases with price hikes.",
         )
         
-        results = await pipeline.search("pricing", top_k=3)
+        results = await pipeline.search("pricing", top_k=3,
+                                        filters={"doc_id": "doc1"})
         
         assert isinstance(results, list)
+        assert len(results) > 0
         for result in results:
             assert isinstance(result, ChunkResult)
             assert result.doc_id == "doc1"
@@ -170,14 +174,21 @@ class TestHaystackPipeline:
     @pytest.mark.asyncio
     async def test_delete_document(self, pipeline):
         """Should delete all chunks for a document."""
-        await pipeline.initialize()
+        await pipeline.add_document(
+            doc_id="to_delete",
+            content="This is test content for deletion. It should be removed afterwards.",
+        )
         
-        await pipeline.add_document(doc_id="to_delete", content="Test content")
-        assert pipeline.chunk_count > 0
+        # Verify document was indexed
+        results_before = await pipeline.search("test deletion", top_k=5,
+                                               filters={"doc_id": "to_delete"})
+        assert len(results_before) > 0
         
-        deleted = await pipeline.delete_document("to_delete")
-        # In mock mode, chunks should be gone
-        remaining = await pipeline.search("", filters={"doc_id": "to_delete"})
+        await pipeline.delete_document("to_delete")
+        
+        # After deletion, search scoped to that doc should return nothing
+        remaining = await pipeline.search("test deletion", top_k=5,
+                                          filters={"doc_id": "to_delete"})
         assert len(remaining) == 0
 
 
@@ -185,15 +196,21 @@ class TestHaystackService:
     """Test Haystack service."""
     
     @pytest.fixture
-    def service(self):
-        """Create service."""
-        return HaystackService()
+    async def service(self):
+        """Create service and clean up afterwards."""
+        svc = HaystackService()
+        await svc.initialize()
+        yield svc
+        # Cleanup
+        for doc_id in ("doc1", "svc_test"):
+            try:
+                await svc.pipeline.delete_document(doc_id)
+            except Exception:
+                pass
     
     @pytest.mark.asyncio
     async def test_retrieve_evidence(self, service):
         """Should return EvidenceBundle objects."""
-        await service.initialize()
-        
         await service.index_document(
             doc_id="doc1",
             content="Revenue grew 15% after the pricing change.",
@@ -216,15 +233,21 @@ class TestRetrievalRouter:
     """Test retrieval router."""
     
     @pytest.fixture
-    def router(self):
-        """Create router."""
-        return RetrievalRouter()
+    async def router(self):
+        """Create router and clean up afterwards."""
+        r = RetrievalRouter()
+        await r.initialize()
+        yield r
+        # Cleanup test documents
+        for doc_id in ("test", "test_doc"):
+            try:
+                await r.haystack.pipeline.delete_document(doc_id)
+            except Exception:
+                pass
     
     @pytest.mark.asyncio
     async def test_retrieve_simple(self, router):
         """Simple retrieval should work."""
-        await router.initialize()
-        
         # Index a document first
         await router.haystack.index_document(
             doc_id="test",
@@ -245,10 +268,10 @@ class TestRetrievalRouter:
         strategy = router._determine_strategy(request)
         assert strategy == RetrievalStrategy.PAGEINDEX_ONLY
         
-        # Default -> Haystack
+        # Default -> Hybrid (Phase 2: upgraded from HAYSTACK_ONLY)
         request = RetrievalRequest(query="test")
         strategy = router._determine_strategy(request)
-        assert strategy == RetrievalStrategy.HAYSTACK_ONLY
+        assert strategy == RetrievalStrategy.HYBRID
         
         # With doc_ids -> Both
         request = RetrievalRequest(query="test", doc_ids=["doc1"])
@@ -293,7 +316,6 @@ class TestRetrievalRouter:
     @pytest.mark.asyncio
     async def test_ingest_document(self, router):
         """Should ingest into both systems."""
-        await router.initialize()
         
         result = await router.ingest_document(
             doc_id="test_doc",

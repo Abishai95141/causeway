@@ -140,8 +140,8 @@ def main():
                 conn = psycopg2.connect(
                     host="localhost",
                     port=5432,
-                    user="postgres",
-                    password="postgres",
+                    user="causeway",
+                    password="causeway_dev",
                     database="causeway"
                 )
                 conn.close()

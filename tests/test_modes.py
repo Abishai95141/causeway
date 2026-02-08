@@ -14,6 +14,7 @@ from src.modes.mode1 import (
     Mode1Stage,
     Mode1Result,
     VariableCandidate,
+    EdgeCandidate,
 )
 from src.modes.mode2 import (
     Mode2DecisionSupport,
@@ -27,7 +28,9 @@ from src.models.enums import (
     VariableType,
     MeasurementStatus,
     ConfidenceLevel,
+    VariableRole,
 )
+from src.causal.pywhyllm_bridge import CausalGraphBridge
 
 
 class TestMode1WorldModelConstruction:
@@ -251,6 +254,138 @@ class TestMode2DecisionSupport:
         
         assert len(insights) > 0
         assert insights[0].mediators == ["demand"] or "demand" in insights[0].mediators
+
+
+class TestMode1Phase1:
+    """Test Phase 1 evidence-grounded DAG construction in Mode 1."""
+
+    @pytest.fixture
+    def mode1(self):
+        """Create Mode 1 instance with explicit mock bridge."""
+        bridge = CausalGraphBridge(api_key=None)
+        return Mode1WorldModelConstruction(causal_bridge=bridge)
+
+    def test_constructor_accepts_causal_bridge(self):
+        """Should accept a CausalGraphBridge in constructor."""
+        bridge = CausalGraphBridge(api_key=None)
+        mode1 = Mode1WorldModelConstruction(causal_bridge=bridge)
+        assert mode1.bridge is bridge
+        assert mode1.bridge.is_mock_mode
+
+    def test_constructor_auto_creates_bridge(self):
+        """When no bridge is given, should auto-create from config."""
+        mode1 = Mode1WorldModelConstruction()
+        assert hasattr(mode1, 'bridge')
+        assert isinstance(mode1.bridge, CausalGraphBridge)
+
+    @pytest.mark.asyncio
+    async def test_run_creates_evidence_grounded_result(self, mode1):
+        """Full run should produce a result with evidence links."""
+        await mode1.initialize()
+        result = await mode1.run(
+            domain="test_domain",
+            initial_query="test query",
+            max_variables=5,
+        )
+        assert isinstance(result, Mode1Result)
+        assert result.evidence_linked >= 0  # At least 0 evidence cached
+
+    def test_variable_candidate_has_role_field(self):
+        """VariableCandidate should support the role field."""
+        vc = VariableCandidate(
+            name="Price",
+            description="Product price",
+            var_type=VariableType.CONTINUOUS,
+            measurement_status=MeasurementStatus.MEASURED,
+            role=VariableRole.TREATMENT,
+        )
+        assert vc.role == VariableRole.TREATMENT
+
+    def test_variable_candidate_default_role(self):
+        """VariableCandidate should default to UNKNOWN role."""
+        vc = VariableCandidate(
+            name="X",
+            description="test",
+            var_type=VariableType.CONTINUOUS,
+            measurement_status=MeasurementStatus.MEASURED,
+        )
+        assert vc.role == VariableRole.UNKNOWN
+
+    def test_edge_candidate_has_evidence_fields(self):
+        """EdgeCandidate should have evidence bundle IDs, contradictions, assumptions."""
+        ec = EdgeCandidate(
+            from_var="price",
+            to_var="demand",
+            mechanism="Price elasticity",
+            strength=EvidenceStrength.MODERATE,
+            evidence_bundle_ids=[uuid4()],
+            contradicting_refs=["hash123"],
+            contradicting_bundle_ids=[uuid4()],
+            assumptions=["No confounders"],
+            conditions=["US market"],
+            confidence=0.7,
+        )
+        assert len(ec.evidence_bundle_ids) == 1
+        assert len(ec.contradicting_refs) == 1
+        assert len(ec.assumptions) == 1
+        assert len(ec.conditions) == 1
+        assert ec.confidence == 0.7
+
+    def test_parse_edges_with_evidence_ids(self, mode1):
+        """Should parse evidence_ids and assumptions from LLM JSON."""
+        content = '''```json
+        [
+            {
+                "from_var": "price",
+                "to_var": "demand",
+                "mechanism": "Price elasticity",
+                "strength": "strong",
+                "evidence_ids": ["abc123", "def456"],
+                "assumptions": ["No confounders", "Temporal ordering"]
+            }
+        ]
+        ```'''
+        edges = mode1._parse_edges(content)
+        assert len(edges) == 1
+        assert edges[0].evidence_refs == ["abc123", "def456"]
+        assert edges[0].assumptions == ["No confounders", "Temporal ordering"]
+
+    def test_parse_edges_without_evidence_ids(self, mode1):
+        """Should handle edges without evidence_ids (backward compat)."""
+        content = '''```json
+        [
+            {"from_var": "a", "to_var": "b", "mechanism": "A→B", "strength": "hypothesis"}
+        ]
+        ```'''
+        edges = mode1._parse_edges(content)
+        assert len(edges) == 1
+        assert edges[0].evidence_refs == []
+        assert edges[0].assumptions == []
+
+    def test_evidence_grounded_dag_prompt_exists(self):
+        """EVIDENCE_GROUNDED_DAG_PROMPT should require evidence citations."""
+        prompt = Mode1WorldModelConstruction.EVIDENCE_GROUNDED_DAG_PROMPT
+        assert "evidence" in prompt.lower()
+        assert "evidence_ids" in prompt
+        assert "assumptions" in prompt
+
+    @pytest.mark.asyncio
+    async def test_run_audit_includes_contradiction_info(self, mode1):
+        """Audit trail should include contradiction and contested edge stats."""
+        await mode1.initialize()
+        result = await mode1.run(
+            domain="audit_test",
+            initial_query="test",
+        )
+        # Find the triangulation audit entry
+        tri_entries = [
+            e for e in result.audit_entries
+            if e.action == "evidence_triangulation_complete"
+        ]
+        assert len(tri_entries) == 1
+        data = tri_entries[0].data
+        assert "contradicting_evidence" in data
+        assert "contested_edges" in data
 
 
 class TestMode1Stage:

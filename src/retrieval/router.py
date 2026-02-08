@@ -4,13 +4,20 @@ Retrieval Router
 Routes retrieval queries to the appropriate backend (PageIndex or Haystack)
 and merges results into unified EvidenceBundle format.
 
+Phase 2 additions:
+- HYBRID_MERGE strategy (BM25 + vector fusion within Haystack)
+- Hypothesis-aware retrieval for causal claim testing
+- Evidence sufficiency thresholds
+- Re-ranking support
+
 Routing logic:
 - PageIndex: Policy docs, postmortems, specs (when provenance matters)
 - Haystack: Semantic search across all content
+- Hybrid: BM25 + vector fusion with re-ranking
 - Both: Comprehensive search with deduplication
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 from uuid import UUID
@@ -18,13 +25,18 @@ from uuid import UUID
 from src.models.evidence import EvidenceBundle
 from src.models.enums import RetrievalMethod
 from src.pageindex.service import PageIndexService
-from src.haystack_svc.service import HaystackService
+from src.haystack_svc.service import (
+    HaystackService,
+    HypothesisQuery,
+    EvidenceAssessment,
+)
 
 
 class RetrievalStrategy(str, Enum):
     """Strategy for retrieval routing."""
     PAGEINDEX_ONLY = "pageindex_only"
     HAYSTACK_ONLY = "haystack_only"
+    HYBRID = "hybrid"          # Phase 2: BM25 + vector inside Haystack
     BOTH_MERGE = "both_merge"
     AUTO = "auto"
 
@@ -38,6 +50,9 @@ class RetrievalRequest:
     strategy: RetrievalStrategy = RetrievalStrategy.AUTO
     max_results: int = 10
     require_provenance: bool = False  # If True, prefer PageIndex
+    use_reranking: bool = False       # Phase 2: apply re-ranking
+    vector_weight: float = 0.5        # Phase 2: weight for vector score
+    bm25_weight: float = 0.5          # Phase 2: weight for BM25 score
 
 
 class RetrievalRouter:
@@ -46,6 +61,9 @@ class RetrievalRouter:
     
     Features:
     - Automatic strategy selection
+    - Hybrid BM25 + vector retrieval (Phase 2)
+    - Hypothesis-aware retrieval (Phase 2)
+    - Evidence sufficiency checks (Phase 2)
     - Result merging and deduplication
     - Unified EvidenceBundle output
     """
@@ -85,6 +103,8 @@ class RetrievalRouter:
             return await self._retrieve_pageindex(request)
         elif strategy == RetrievalStrategy.HAYSTACK_ONLY:
             return await self._retrieve_haystack(request)
+        elif strategy == RetrievalStrategy.HYBRID:
+            return await self._retrieve_hybrid(request)
         else:  # BOTH_MERGE
             return await self._retrieve_both(request)
     
@@ -123,8 +143,8 @@ class RetrievalRouter:
         if request.doc_ids:
             return RetrievalStrategy.BOTH_MERGE
         
-        # Default to Haystack for semantic search
-        return RetrievalStrategy.HAYSTACK_ONLY
+        # Phase 2: default to hybrid for better recall
+        return RetrievalStrategy.HYBRID
     
     async def _retrieve_pageindex(
         self,
@@ -185,6 +205,102 @@ class RetrievalRouter:
         # Merge and deduplicate
         all_bundles = pi_bundles + hs_bundles
         return self._deduplicate(all_bundles, request.max_results)
+
+    async def _retrieve_hybrid(
+        self,
+        request: RetrievalRequest,
+    ) -> list[EvidenceBundle]:
+        """Retrieve using hybrid BM25 + vector fusion."""
+        all_bundles: list[EvidenceBundle] = []
+
+        if request.doc_ids:
+            per_doc = max(1, request.max_results // len(request.doc_ids))
+            for doc_id in request.doc_ids:
+                doc_title = (request.doc_titles or {}).get(doc_id, doc_id)
+                bundles = await self.haystack.retrieve_hybrid(
+                    query=request.query,
+                    doc_id=doc_id,
+                    doc_title=doc_title,
+                    top_k=per_doc,
+                    vector_weight=request.vector_weight,
+                    bm25_weight=request.bm25_weight,
+                    rerank=request.use_reranking,
+                )
+                all_bundles.extend(bundles)
+        else:
+            all_bundles = await self.haystack.retrieve_hybrid(
+                query=request.query,
+                top_k=request.max_results,
+                vector_weight=request.vector_weight,
+                bm25_weight=request.bm25_weight,
+                rerank=request.use_reranking,
+            )
+
+        return all_bundles[:request.max_results]
+
+    # ------------------------------------------------------------------ #
+    # Hypothesis-aware retrieval (Phase 2)
+    # ------------------------------------------------------------------ #
+
+    async def retrieve_for_hypothesis(
+        self,
+        cause: str,
+        effect: str,
+        mechanism: str = "",
+        domain: str = "",
+        top_k: int = 5,
+    ) -> EvidenceAssessment:
+        """
+        Test a causal hypothesis against the evidence corpus.
+
+        Convenience method that delegates to HaystackService.
+
+        Args:
+            cause:     Cause variable name
+            effect:    Effect variable name
+            mechanism: Optional mechanism description
+            domain:    Optional domain context
+            top_k:     Max results per direction
+
+        Returns:
+            EvidenceAssessment with supporting/contradicting evidence
+        """
+        hypothesis = HypothesisQuery(
+            cause=cause,
+            effect=effect,
+            mechanism=mechanism,
+            domain=domain,
+        )
+        return await self.haystack.retrieve_for_hypothesis(
+            hypothesis=hypothesis,
+            top_k=top_k,
+        )
+
+    async def check_evidence_sufficiency(
+        self,
+        cause: str,
+        effect: str,
+        existing_evidence: list[EvidenceBundle] | None = None,
+        min_supporting: int = 2,
+    ) -> EvidenceAssessment:
+        """
+        Check whether sufficient evidence exists for a causal claim.
+
+        Args:
+            cause:              Cause variable
+            effect:             Effect variable
+            existing_evidence:  Previously retrieved evidence (optional)
+            min_supporting:     Minimum supporting evidence count
+
+        Returns:
+            EvidenceAssessment with sufficiency judgment
+        """
+        return await self.haystack.check_evidence_sufficiency(
+            cause=cause,
+            effect=effect,
+            existing_evidence=existing_evidence,
+            min_supporting=min_supporting,
+        )
     
     def _deduplicate(
         self,
