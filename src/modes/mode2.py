@@ -17,7 +17,7 @@ from enum import Enum
 import os
 import textwrap
 
-import langextract as lx
+from src.extraction.service import ExtractionService
 
 from src.agent.llm_client import LLMClient
 from src.causal.service import CausalService
@@ -101,60 +101,7 @@ class Mode2DecisionSupport:
     - Confidence-scored recommendations
     """
     
-    # ── LangExtract prompt descriptions ────────────────────────────
-
-    QUERY_EXTRACT_PROMPT = textwrap.dedent("""\
-        Extract the decision query components from the text: the business
-        domain, the proposed intervention (action being considered), the
-        target outcome to optimise, and any constraints mentioned.
-        Use exact phrases from the text.""")
-
-    QUERY_EXTRACT_EXAMPLES = [
-        lx.data.ExampleData(
-            text="Should we increase prices to boost revenue while staying within budget?",
-            extractions=[
-                lx.data.Extraction(
-                    extraction_class="decision_query",
-                    extraction_text="increase prices to boost revenue",
-                    attributes={
-                        "domain": "pricing",
-                        "intervention": "increase prices",
-                        "target_outcome": "revenue",
-                        "constraints": "staying within budget",
-                    },
-                ),
-            ],
-        ),
-    ]
-
-    RECOMMENDATION_EXTRACT_PROMPT = textwrap.dedent("""\
-        Extract recommendation claims from the causal analysis and evidence.
-        Each claim should be grounded in exact text from the evidence.
-        Attributes must include the recommendation, confidence level,
-        reasoning, suggested actions, and risks.""")
-
-    RECOMMENDATION_EXTRACT_EXAMPLES = [
-        lx.data.ExampleData(
-            text=(
-                "Analysis shows price increases reduce demand through elasticity. "
-                "Revenue impact is positive when demand drop is below 15%. "
-                "Risk: competitor under-cutting may negate gains."
-            ),
-            extractions=[
-                lx.data.Extraction(
-                    extraction_class="recommendation_claim",
-                    extraction_text="price increases reduce demand through elasticity",
-                    attributes={
-                        "recommendation": "Implement moderate price increase of 5-10%",
-                        "confidence": "medium",
-                        "reasoning": "Elasticity effect is present but manageable",
-                        "actions": "Raise prices gradually, monitor demand weekly",
-                        "risks": "Competitor under-cutting may negate gains",
-                    },
-                ),
-            ],
-        ),
-    ]
+    # ── LangExtract prompts/examples centralised in ExtractionService ──
 
     def __init__(
         self,
@@ -162,11 +109,15 @@ class Mode2DecisionSupport:
         retrieval_router: Optional[RetrievalRouter] = None,
         causal_service: Optional[CausalService] = None,
         evidence_freshness_days: int = 30,
+        extraction_service: Optional[ExtractionService] = None,
     ):
         self.llm = llm_client or LLMClient()
         self.retrieval = retrieval_router or RetrievalRouter()
         self.causal = causal_service or CausalService()
         self.evidence_freshness_days = evidence_freshness_days
+
+        # Centralised extraction service
+        self.extraction = extraction_service or ExtractionService()
         
         self._current_stage = Mode2Stage.QUERY_PARSING
         self._evidence_cache: dict[str, EvidenceBundle] = {}

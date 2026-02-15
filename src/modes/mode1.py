@@ -22,10 +22,8 @@ from typing import Any, Optional
 from uuid import UUID, uuid4
 from enum import Enum
 import logging
-import os
-import textwrap
 
-import langextract as lx
+from src.extraction.service import ExtractionService
 
 from src.agent.orchestrator import AgentOrchestrator
 from src.agent.llm_client import LLMClient
@@ -123,132 +121,7 @@ class Mode1WorldModelConstruction:
     - Human approval workflow
     """
     
-    # ── LangExtract prompt descriptions ────────────────────────────────────
-
-    VARIABLE_EXTRACT_PROMPT = textwrap.dedent("""\
-        Extract every measurable causal variable mentioned or implied in the
-        evidence text.  A causal model typically needs 8-15 variables.
-        Think across categories: inputs, processes, outputs, quality,
-        demand, satisfaction, competition, and environment.
-        Use exact phrases from the text for extraction_text.  Do not
-        paraphrase or overlap entities.""")
-
-    VARIABLE_EXTRACT_EXAMPLES = [
-        lx.data.ExampleData(
-            text=(
-                "Higher staff training hours improved barista skill levels. "
-                "Seasonal foot traffic drives daily customer volume. "
-                "Specialty drink pricing is set above competitor averages."
-            ),
-            extractions=[
-                lx.data.Extraction(
-                    extraction_class="variable",
-                    extraction_text="staff training hours",
-                    attributes={
-                        "type": "continuous",
-                        "measurement_status": "measured",
-                        "description": "Hours of barista training per quarter",
-                    },
-                ),
-                lx.data.Extraction(
-                    extraction_class="variable",
-                    extraction_text="barista skill levels",
-                    attributes={
-                        "type": "continuous",
-                        "measurement_status": "observable",
-                        "description": "Assessed proficiency of barista staff",
-                    },
-                ),
-                lx.data.Extraction(
-                    extraction_class="variable",
-                    extraction_text="Seasonal foot traffic",
-                    attributes={
-                        "type": "continuous",
-                        "measurement_status": "measured",
-                        "description": "Pedestrian volume influenced by season",
-                    },
-                ),
-                lx.data.Extraction(
-                    extraction_class="variable",
-                    extraction_text="daily customer volume",
-                    attributes={
-                        "type": "continuous",
-                        "measurement_status": "measured",
-                        "description": "Number of customers visiting per day",
-                    },
-                ),
-                lx.data.Extraction(
-                    extraction_class="variable",
-                    extraction_text="Specialty drink pricing",
-                    attributes={
-                        "type": "continuous",
-                        "measurement_status": "measured",
-                        "description": "Price point for specialty beverages",
-                    },
-                ),
-                lx.data.Extraction(
-                    extraction_class="variable",
-                    extraction_text="competitor averages",
-                    attributes={
-                        "type": "continuous",
-                        "measurement_status": "observable",
-                        "description": "Average competitor pricing in the area",
-                    },
-                ),
-            ],
-        )
-    ]
-
-    EDGE_EXTRACT_PROMPT = textwrap.dedent("""\
-        Extract every causal relationship between variables found in the
-        evidence text.  For each relationship use exact sentences or phrases
-        from the text as extraction_text — this is the proof that the
-        relationship exists.
-        Attributes must include from_var and to_var using snake_case IDs,
-        the causal mechanism, and evidence strength.
-        Consider ALL possible variable pairs; a useful model has many edges.""")
-
-    EDGE_EXTRACT_EXAMPLES = [
-        lx.data.ExampleData(
-            text=(
-                "Higher staff training hours improved barista skill levels. "
-                "Better barista skills led to higher drink quality scores. "
-                "Seasonal foot traffic drives daily customer volume."
-            ),
-            extractions=[
-                lx.data.Extraction(
-                    extraction_class="causal_edge",
-                    extraction_text="Higher staff training hours improved barista skill levels",
-                    attributes={
-                        "from_var": "staff_training_hours",
-                        "to_var": "barista_skill_levels",
-                        "mechanism": "Training increases proficiency",
-                        "strength": "strong",
-                    },
-                ),
-                lx.data.Extraction(
-                    extraction_class="causal_edge",
-                    extraction_text="Better barista skills led to higher drink quality scores",
-                    attributes={
-                        "from_var": "barista_skill_levels",
-                        "to_var": "drink_quality_scores",
-                        "mechanism": "Skilled baristas produce better drinks",
-                        "strength": "moderate",
-                    },
-                ),
-                lx.data.Extraction(
-                    extraction_class="causal_edge",
-                    extraction_text="Seasonal foot traffic drives daily customer volume",
-                    attributes={
-                        "from_var": "seasonal_foot_traffic",
-                        "to_var": "daily_customer_volume",
-                        "mechanism": "More pedestrians means more walk-in customers",
-                        "strength": "strong",
-                    },
-                ),
-            ],
-        )
-    ]
+    # ── LangExtract prompts/examples centralised in ExtractionService ───
 
     def __init__(
         self,
@@ -256,6 +129,7 @@ class Mode1WorldModelConstruction:
         retrieval_router: Optional[RetrievalRouter] = None,
         causal_service: Optional[CausalService] = None,
         causal_bridge: Optional[CausalGraphBridge] = None,
+        extraction_service: Optional[ExtractionService] = None,
     ):
         self.llm = llm_client or LLMClient()
         self.retrieval = retrieval_router or RetrievalRouter()
@@ -268,6 +142,9 @@ class Mode1WorldModelConstruction:
             from src.config import get_settings
             settings = get_settings()
             self.bridge = CausalGraphBridge(api_key=settings.google_ai_api_key)
+
+        # Centralised extraction service
+        self.extraction = extraction_service or ExtractionService()
         
         self._current_stage = Mode1Stage.VARIABLE_DISCOVERY
         self._evidence_cache: dict[str, EvidenceBundle] = {}
@@ -534,42 +411,28 @@ class Mode1WorldModelConstruction:
                 e.content[:500] for e in evidence[:15]
             )
 
-        # ── LangExtract: structured variable extraction ───────────────
-        prompt_desc = (
-            f"Domain: {domain}. "
-            + self.VARIABLE_EXTRACT_PROMPT
+        # ── ExtractionService: structured variable extraction ─────────
+        # Build evidence_map for citation validation
+        ev_map: dict[str, str] = {
+            e.content_hash[:12]: e.content
+            for e in self._evidence_cache.values()
+        }
+
+        extracted = self.extraction.extract_variables(
+            evidence_text=evidence_text,
+            domain=domain,
+            evidence_map=ev_map,
         )
 
-        from src.config import get_settings
-        api_key = get_settings().google_ai_api_key
-
-        result = lx.extract(
-            text_or_documents=evidence_text,
-            prompt_description=prompt_desc,
-            examples=self.VARIABLE_EXTRACT_EXAMPLES,
-            model_id="gemini-2.5-flash",
-            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
-            show_progress=False,
-        )
-
-        # Map extractions → VariableCandidate
+        # Map ExtractedVariable → VariableCandidate
         variables: list[VariableCandidate] = []
-        seen_names: set[str] = set()
-        for ext in (result.extractions or []):
-            if ext.extraction_class != "variable":
-                continue
-            attrs = ext.attributes or {}
-            name = ext.extraction_text.strip()
-            if not name or name.lower() in seen_names:
-                continue
-            seen_names.add(name.lower())
-
-            var_type_str = attrs.get("type", "continuous").lower()
-            meas_str = attrs.get("measurement_status", "measured").lower()
+        for ev in extracted:
+            var_type_str = ev.var_type
+            meas_str = ev.measurement_status
 
             variables.append(VariableCandidate(
-                name=name,
-                description=attrs.get("description", ""),
+                name=ev.name,
+                description=ev.description,
                 var_type=(
                     VariableType(var_type_str)
                     if var_type_str in ["continuous", "discrete", "binary", "categorical"]
@@ -580,11 +443,7 @@ class Mode1WorldModelConstruction:
                     if meas_str in ["measured", "observable", "latent"]
                     else MeasurementStatus.MEASURED
                 ),
-                # Provenance: match extraction_text back to evidence cache
-                evidence_sources=[
-                    h for h, eb in self._evidence_cache.items()
-                    if ext.extraction_text.lower() in eb.content.lower()
-                ],
+                evidence_sources=ev.grounded_evidence_keys,
             ))
 
         _logger.info(
@@ -690,136 +549,52 @@ class Mode1WorldModelConstruction:
                 confidence=proposal.confidence,
             ))
 
-        # ── Stage B: LangExtract — grounded causal edge extraction ────
-        # Build variable context string so LangExtract knows the IDs
-        var_context = ", ".join(
-            f"{_re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')} ({v.name})"
-            for v in variables
-        )
+        # ── Stage B: ExtractionService — grounded causal edge extraction ─
         evidence_text = "\n\n".join(
             eb.content[:500] for eb in list(self._evidence_cache.values())[:15]
         )
-        full_text = (
-            f"Domain: {domain}. "
-            f"Variables: {var_context}.\n\n"
-            f"Evidence:\n{evidence_text}"
-        )
 
-        # ── Dynamic prompt: constrain LangExtract to discovered vars ──
-        allowed_vars_str = ", ".join(var_ids)
-        dynamic_edge_prompt = textwrap.dedent(f"""\
-            Extract every causal relationship between variables found in
-            the evidence text.  For each relationship use exact sentences
-            or phrases from the text as extraction_text — this is the
-            proof that the relationship exists.
+        var_names = [v.name for v in variables]
 
-            CRITICAL CONSTRAINT: You MUST ONLY use variable IDs from
-            this list: {allowed_vars_str}
-            Do NOT invent new variable names.  The from_var and to_var
-            attributes MUST exactly match one of the IDs listed above.
+        # Build evidence_map for citation validation
+        ev_map: dict[str, str] = {
+            h: eb.content for h, eb in self._evidence_cache.items()
+        }
 
-            Attributes must include from_var and to_var (using the exact
-            IDs above), the causal mechanism, and evidence strength
-            (strong / moderate / hypothesis).
-            Consider ALL possible variable pairs; a useful model has
-            many edges.""")
-
-        # ── Dynamic examples: use actual variable IDs, not hardcoded ──
-        dynamic_edge_examples: list[lx.data.ExampleData] = []
-        if len(var_ids) >= 2:
-            _ex_extractions = [
-                lx.data.Extraction(
-                    extraction_class="causal_edge",
-                    extraction_text=(
-                        f"Changes in {variables[0].name} influence "
-                        f"{variables[1].name}"
-                    ),
-                    attributes={
-                        "from_var": var_ids[0],
-                        "to_var": var_ids[1],
-                        "mechanism": "Direct causal influence",
-                        "strength": "moderate",
-                    },
-                ),
-            ]
-            _ex_text_parts = [
-                f"{variables[0].name} influences {variables[1].name}."
-            ]
-            if len(var_ids) >= 3:
-                _ex_extractions.append(
-                    lx.data.Extraction(
-                        extraction_class="causal_edge",
-                        extraction_text=(
-                            f"{variables[1].name} drives changes in "
-                            f"{variables[2].name}"
-                        ),
-                        attributes={
-                            "from_var": var_ids[1],
-                            "to_var": var_ids[2],
-                            "mechanism": "Indirect influence",
-                            "strength": "hypothesis",
-                        },
-                    )
-                )
-                _ex_text_parts.append(
-                    f"{variables[1].name} drives {variables[2].name}."
-                )
-            dynamic_edge_examples = [
-                lx.data.ExampleData(
-                    text=" ".join(_ex_text_parts),
-                    extractions=_ex_extractions,
-                )
-            ]
-        else:
-            # Fallback: use class-level examples when <2 variables
-            dynamic_edge_examples = self.EDGE_EXTRACT_EXAMPLES
-
-        from src.config import get_settings
-        api_key = get_settings().google_ai_api_key
-
-        lx_result = lx.extract(
-            text_or_documents=full_text,
-            prompt_description=dynamic_edge_prompt,
-            examples=dynamic_edge_examples,
-            model_id="gemini-2.5-flash",
-            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
-            show_progress=False,
+        extracted_edges = self.extraction.extract_edges(
+            evidence_text=evidence_text,
+            domain=domain,
+            variable_ids=var_ids,
+            variable_names=var_names,
+            evidence_map=ev_map,
         )
 
         lx_edge_count = 0
-        for ext in (lx_result.extractions or []):
-            if ext.extraction_class != "causal_edge":
-                continue
-            attrs = ext.attributes or {}
-            from_var = (attrs.get("from_var") or "").strip()
-            to_var = (attrs.get("to_var") or "").strip()
-            if not from_var or not to_var:
-                continue
-            pair = (from_var, to_var)
+        strength_map = {
+            "strong": EvidenceStrength.STRONG,
+            "moderate": EvidenceStrength.MODERATE,
+            "hypothesis": EvidenceStrength.HYPOTHESIS,
+        }
+        for ee in extracted_edges:
+            pair = (ee.from_var, ee.to_var)
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
 
-            strength_str = (attrs.get("strength") or "hypothesis").lower()
-            strength_map = {
-                "strong": EvidenceStrength.STRONG,
-                "moderate": EvidenceStrength.MODERATE,
-                "hypothesis": EvidenceStrength.HYPOTHESIS,
-            }
+            strength_str = ee.strength
+            grounded_refs = ee.grounded_evidence_keys
 
-            # ── Provenance: match extraction_text to evidence cache ───
-            grounded_refs: list[str] = []
+            # Look up bundle IDs for grounded refs
             grounded_bundle_ids: list[UUID] = []
-            quote = ext.extraction_text.lower()
-            for h, eb in self._evidence_cache.items():
-                if quote in eb.content.lower():
-                    grounded_refs.append(h)
+            for h in grounded_refs:
+                eb = self._evidence_cache.get(h)
+                if eb:
                     grounded_bundle_ids.append(eb.bundle_id)
 
             edges.append(EdgeCandidate(
-                from_var=from_var,
-                to_var=to_var,
-                mechanism=attrs.get("mechanism", ""),
+                from_var=ee.from_var,
+                to_var=ee.to_var,
+                mechanism=ee.mechanism,
                 strength=strength_map.get(strength_str, EvidenceStrength.HYPOTHESIS),
                 evidence_refs=grounded_refs,
                 evidence_bundle_ids=grounded_bundle_ids,

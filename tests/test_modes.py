@@ -31,6 +31,13 @@ from src.models.enums import (
     VariableRole,
 )
 from src.causal.pywhyllm_bridge import CausalGraphBridge
+from src.extraction.service import (
+    ExtractionService,
+    ExtractedVariable,
+    ExtractedEdge,
+    ExtractedQuery,
+    ExtractedRecommendation,
+)
 
 
 class TestMode1WorldModelConstruction:
@@ -74,47 +81,36 @@ class TestMode1WorldModelConstruction:
         
         assert len(result.audit_entries) > 0
     
-    def test_parse_variables_valid_json(self, mode1):
-        """Should parse variables from valid JSON."""
-        content = '''```json
-        [
-            {"variable_id": "price", "name": "Price", "description": "Product price", "type": "continuous", "measurement_status": "measured"},
-            {"variable_id": "demand", "name": "Demand", "description": "Customer demand", "type": "continuous", "measurement_status": "measured"}
+    def test_mode1_has_extraction_service(self, mode1):
+        """Mode 1 should have an ExtractionService instance."""
+        assert hasattr(mode1, 'extraction')
+        assert isinstance(mode1.extraction, ExtractionService)
+
+    def test_extraction_service_dedup_variables(self):
+        """ExtractionService._dedup_variables should collapse near-duplicates."""
+        variables = [
+            ExtractedVariable(name="local residents", description="People living nearby", var_type="continuous", measurement_status="measured"),
+            ExtractedVariable(name="local_residents", description="Another phrasing", var_type="continuous", measurement_status="measured"),
         ]
-        ```'''
-        
-        variables = mode1._parse_variables(content)
-        
-        assert len(variables) == 2
-        assert variables[0].name == "Price"
-        assert variables[1].name == "Demand"
-    
-    def test_parse_edges_valid_json(self, mode1):
-        """Should parse edges from valid JSON."""
-        content = '''```json
-        [
-            {"from_var": "price", "to_var": "demand", "mechanism": "Price affects demand", "strength": "strong"}
-        ]
-        ```'''
-        
-        edges = mode1._parse_edges(content)
-        
-        assert len(edges) == 1
-        assert edges[0].from_var == "price"
-        assert edges[0].to_var == "demand"
-        assert edges[0].strength == EvidenceStrength.STRONG
-    
-    def test_parse_variables_handles_invalid_json(self, mode1):
-        """Should handle invalid JSON gracefully."""
-        content = "Not valid JSON"
-        variables = mode1._parse_variables(content)
-        assert variables == []
-    
-    def test_parse_edges_handles_invalid_json(self, mode1):
-        """Should handle invalid JSON gracefully."""
-        content = "Not valid JSON"
-        edges = mode1._parse_edges(content)
-        assert edges == []
+        deduped = ExtractionService._dedup_variables(variables)
+        assert len(deduped) == 1
+        assert deduped[0].name == "local residents"
+
+    def test_extraction_service_validate_citation_match(self):
+        """Citation validation should match when tokens overlap."""
+        keys = ExtractionService._validate_citation(
+            "price increases reduce demand",
+            {"chunk1": "Studies show price increases reduce demand through elasticity"},
+        )
+        assert "chunk1" in keys
+
+    def test_extraction_service_validate_citation_reject(self):
+        """Citation validation should reject unrelated evidence."""
+        keys = ExtractionService._validate_citation(
+            "price increases reduce demand",
+            {"chunk1": "The weather was sunny today in the park"},
+        )
+        assert keys == []
     
     @pytest.mark.asyncio
     async def test_approve_model_changes_status(self, mode1):
@@ -200,24 +196,22 @@ class TestMode2DecisionSupport:
         
         assert len(result.audit_entries) > 0
     
-    def test_extract_parsed_query_valid_json(self, mode2):
-        """Should extract parsed query from valid JSON."""
-        content = '''```json
-        {"domain": "pricing", "intervention": "increase prices", "target_outcome": "revenue", "constraints": ["budget limit"]}
-        ```'''
-        
-        parsed = mode2._extract_parsed_query(content)
-        
-        assert parsed.domain == "pricing"
-        assert parsed.intervention == "increase prices"
-        assert parsed.target_outcome == "revenue"
-    
-    def test_extract_parsed_query_handles_invalid_json(self, mode2):
-        """Should handle invalid JSON gracefully."""
-        content = "Not valid JSON"
-        parsed = mode2._extract_parsed_query(content)
-        
-        assert parsed.domain == "general"  # Default
+    def test_mode2_has_extraction_service(self, mode2):
+        """Mode 2 should have an ExtractionService instance."""
+        assert hasattr(mode2, 'extraction')
+        assert isinstance(mode2.extraction, ExtractionService)
+
+    def test_extracted_query_dataclass(self):
+        """ExtractedQuery should hold parsed components."""
+        eq = ExtractedQuery(
+            domain="pricing",
+            intervention="increase prices",
+            target_outcome="revenue",
+            constraints=["budget limit"],
+        )
+        assert eq.domain == "pricing"
+        assert eq.intervention == "increase prices"
+        assert eq.constraints == ["budget limit"]
     
     def test_find_matching_variable_exact_match(self, mode2):
         """Should find exact variable match."""
@@ -331,43 +325,31 @@ class TestMode1Phase1:
         assert len(ec.conditions) == 1
         assert ec.confidence == 0.7
 
-    def test_parse_edges_with_evidence_ids(self, mode1):
-        """Should parse evidence_ids and assumptions from LLM JSON."""
-        content = '''```json
-        [
-            {
-                "from_var": "price",
-                "to_var": "demand",
-                "mechanism": "Price elasticity",
-                "strength": "strong",
-                "evidence_ids": ["abc123", "def456"],
-                "assumptions": ["No confounders", "Temporal ordering"]
-            }
-        ]
-        ```'''
-        edges = mode1._parse_edges(content)
-        assert len(edges) == 1
-        assert edges[0].evidence_refs == ["abc123", "def456"]
-        assert edges[0].assumptions == ["No confounders", "Temporal ordering"]
+    def test_extraction_service_build_edge_examples(self):
+        """ExtractionService should build dynamic edge examples from var IDs."""
+        examples = ExtractionService._build_edge_examples(
+            variable_ids=["price", "demand", "revenue"],
+            variable_names=["Price", "Demand", "Revenue"],
+        )
+        assert len(examples) == 1
+        assert len(examples[0].extractions) == 2  # 2 examples for 3+ vars
+        assert examples[0].extractions[0].attributes["from_var"] == "price"
+        assert examples[0].extractions[1].attributes["to_var"] == "revenue"
 
-    def test_parse_edges_without_evidence_ids(self, mode1):
-        """Should handle edges without evidence_ids (backward compat)."""
-        content = '''```json
-        [
-            {"from_var": "a", "to_var": "b", "mechanism": "A→B", "strength": "hypothesis"}
-        ]
-        ```'''
-        edges = mode1._parse_edges(content)
-        assert len(edges) == 1
-        assert edges[0].evidence_refs == []
-        assert edges[0].assumptions == []
+    def test_extraction_service_build_edge_examples_fallback(self):
+        """Should produce generic example with <2 variables."""
+        examples = ExtractionService._build_edge_examples(
+            variable_ids=["x"],
+            variable_names=["X"],
+        )
+        assert len(examples) == 1
+        assert examples[0].extractions[0].attributes["from_var"] == "a"
 
-    def test_evidence_grounded_dag_prompt_exists(self):
-        """EVIDENCE_GROUNDED_DAG_PROMPT should require evidence citations."""
-        prompt = Mode1WorldModelConstruction.EVIDENCE_GROUNDED_DAG_PROMPT
-        assert "evidence" in prompt.lower()
-        assert "evidence_ids" in prompt
-        assert "assumptions" in prompt
+    def test_extraction_service_edge_prompt_constrains_vars(self):
+        """Edge prompt template should contain the {allowed_vars} placeholder."""
+        from src.extraction.service import _EDGE_PROMPT_TEMPLATE
+        assert "{allowed_vars}" in _EDGE_PROMPT_TEMPLATE
+        assert "MUST ONLY use variable IDs" in _EDGE_PROMPT_TEMPLATE
 
     @pytest.mark.asyncio
     async def test_run_audit_includes_contradiction_info(self, mode1):
