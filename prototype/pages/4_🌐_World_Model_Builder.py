@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 API = "http://localhost:8000/api/v1"
+TASK_KEY = "mode1_build_task"
 
 st.set_page_config(page_title="World Model Builder", page_icon="🌐", layout="wide")
 
@@ -89,6 +90,29 @@ with col_cfg:
         max_variables = st.slider("Max Variables", 5, 50, 20)
         max_edges = st.slider("Max Edges", 10, 100, 50)
 
+    # Document selector — restricts evidence to chosen documents
+    _doc_options: list[dict] = []
+    try:
+        _doc_resp = requests.get(f"{API}/documents", timeout=5)
+        if _doc_resp.ok:
+            _doc_options = [
+                d for d in _doc_resp.json()
+                if d.get("status") == "indexed"
+            ]
+    except Exception:
+        pass
+
+    if _doc_options:
+        _labels = {d["doc_id"]: f"{d['filename']}  ({d['doc_id']})" for d in _doc_options}
+        selected_doc_ids = st.multiselect(
+            "📄 Restrict to Documents (optional)",
+            options=[d["doc_id"] for d in _doc_options],
+            format_func=lambda did: _labels.get(did, did),
+            help="If empty, all indexed documents are searched.",
+        )
+    else:
+        selected_doc_ids = []
+
 with col_info:
     st.markdown("### 📖 Mode 1 Workflow")
     for stage_key in ["variable_discovery", "evidence_gathering", "dag_drafting",
@@ -114,112 +138,179 @@ if st.button("🔨 Build World Model", type="primary", use_container_width=True)
             )
             st.stop()
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        stage_display = st.empty()
-
-        # Launch the request in a background thread
+        # Start async build task in a background thread and persist in session state.
         result_box = _ThreadResult()
+        payload = {
+            "domain": domain,
+            "initial_query": initial_query,
+            "max_variables": max_variables,
+            "max_edges": max_edges,
+        }
+        if selected_doc_ids:
+            payload["doc_ids"] = selected_doc_ids
         thread = threading.Thread(
             target=_post_in_thread,
-            args=(
-                f"{API}/mode1/run",
-                {
-                    "domain": domain,
-                    "initial_query": initial_query,
-                    "max_variables": max_variables,
-                    "max_edges": max_edges,
-                },
-                result_box,
-            ),
+            args=(f"{API}/mode1/run", payload, result_box),
             daemon=True,
         )
         thread.start()
 
-        # Poll until the thread finishes
-        last_stage = ""
-        elapsed = 0
-        while not result_box.done:
-            stage = _poll_stage()
-            si = STAGE_INFO.get(stage)
+        st.session_state[TASK_KEY] = {
+            "thread": thread,
+            "result_box": result_box,
+            "domain": domain,
+            "started_at": time.time(),
+        }
+        st.rerun()
 
-            if si and stage != last_stage:
-                progress_bar.progress(si["pct"])
-                stage_display.info(f"{si['icon']}  **{si['label']}** — working…")
-                last_stage = stage
 
-            status_text.caption(f"⏳ Waiting for response… ({elapsed}s)")
-            time.sleep(2)
-            elapsed += 2
+task = st.session_state.get(TASK_KEY)
+if task:
+    result_box: _ThreadResult = task["result_box"]
+    elapsed = int(time.time() - task["started_at"])
 
-        progress_bar.progress(100)
-        stage_display.empty()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    stage_display = st.empty()
 
-        # ── Handle result ───────────────────────────────────────
-        if result_box.error:
-            status_text.error(f"❌ {result_box.error}")
-        elif result_box.response is not None:
-            resp = result_box.response
-            if resp.status_code == 200:
-                result = resp.json()
-                status_text.success(
-                    f"✅ World model built in ~{elapsed}s!  "
-                    f"**{result['variables_discovered']} variables**, "
-                    f"**{result['edges_created']} edges**, "
-                    f"**{result['evidence_linked']} evidence bundles**"
+    if not result_box.done:
+        # Live stage polling while request is running.
+        stage = _poll_stage()
+        si = STAGE_INFO.get(stage)
+
+        if si:
+            progress_bar.progress(si["pct"])
+            stage_display.info(f"{si['icon']}  **{si['label']}** — working…")
+        else:
+            # Fallback progress when stage endpoint is unavailable.
+            synthetic = min(90, max(5, elapsed // 2))
+            progress_bar.progress(synthetic)
+            stage_display.info("⏳ Processing world model build request…")
+
+        status_text.caption(f"⏳ Waiting for response… ({elapsed}s)")
+
+        # Re-run every 2 seconds so UI stays responsive and updates continuously.
+        time.sleep(2)
+        st.rerun()
+
+    # Task finished
+    progress_bar.progress(100)
+    stage_display.empty()
+
+    if result_box.error:
+        status_text.error(f"❌ {result_box.error}")
+    elif result_box.response is not None:
+        resp = result_box.response
+        if resp.status_code == 200:
+            result = resp.json()
+            status_text.success(
+                f"✅ World model built in ~{elapsed}s!  "
+                f"**{result['variables_discovered']} variables**, "
+                f"**{result['edges_created']} edges**, "
+                f"**{result['evidence_linked']} evidence bundles**"
+            )
+
+            # Persist in session
+            st.session_state.setdefault("world_models", []).append(result)
+            st.session_state["last_domain"] = task["domain"]
+
+            # Metrics row
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Trace ID", result["trace_id"][:12] + "…")
+            c2.metric("Variables", result["variables_discovered"])
+            c3.metric("Edges", result["edges_created"])
+            c4.metric("Evidence", result["evidence_linked"])
+
+            with st.expander("📋 Full Response"):
+                st.json(result)
+
+            if result.get("error"):
+                st.warning(f"⚠️ Note: {result['error']}")
+
+            # ── Approval section ────────────────────────────
+            if result.get("requires_review"):
+                st.markdown("---")
+                st.markdown("### 👤 Human Review")
+                st.info(
+                    "This model is in **review** status. "
+                    "Approve it to make it available for Mode 2 Decision Support."
                 )
 
-                # Persist in session
-                st.session_state.setdefault("world_models", []).append(result)
-                st.session_state["last_domain"] = domain
-
-                # Metrics row
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Trace ID", result["trace_id"][:12] + "…")
-                c2.metric("Variables", result["variables_discovered"])
-                c3.metric("Edges", result["edges_created"])
-                c4.metric("Evidence", result["evidence_linked"])
-
-                with st.expander("📋 Full Response"):
-                    st.json(result)
-
-                if result.get("error"):
-                    st.warning(f"⚠️ Note: {result['error']}")
-
-                # ── Approval section ────────────────────────────
-                if result.get("requires_review"):
-                    st.markdown("---")
-                    st.markdown("### 👤 Human Review")
-                    st.info(
-                        "This model is in **review** status. "
-                        "Approve it to make it available for Mode 2 Decision Support."
+                # ── Fetch and display model details ──────────
+                try:
+                    detail_resp = requests.get(
+                        f"{API}/world-models/{task['domain']}/detail",
+                        timeout=10,
                     )
+                    if detail_resp.status_code == 200:
+                        detail = detail_resp.json()
 
-                    if st.button("✅ Approve & Activate Model", key="approve"):
-                        with st.spinner("Approving…"):
-                            try:
-                                ar = requests.post(
-                                    f"{API}/mode1/approve",
-                                    json={"domain": domain, "approved_by": "prototype_user"},
-                                    timeout=30,
+                        # Variables table
+                        st.markdown("#### 🔍 Discovered Variables")
+                        var_rows = [
+                            {
+                                "ID": v["variable_id"],
+                                "Name": v["name"],
+                                "Definition": v["definition"],
+                                "Type": v.get("var_type", "—"),
+                                "Role": v.get("role", "—"),
+                            }
+                            for v in detail.get("variables", [])
+                        ]
+                        if var_rows:
+                            st.dataframe(var_rows, use_container_width=True)
+                        else:
+                            st.caption("No variables returned.")
+
+                        # Edges table
+                        st.markdown("#### 🔗 Causal Edges")
+                        edge_rows = [
+                            {
+                                "From": e["from_var"],
+                                "To": e["to_var"],
+                                "Mechanism": e["mechanism"],
+                                "Strength": e.get("strength", "—"),
+                                "Confidence": f"{e['confidence']:.0%}" if e.get("confidence") is not None else "—",
+                            }
+                            for e in detail.get("edges", [])
+                        ]
+                        if edge_rows:
+                            st.dataframe(edge_rows, use_container_width=True)
+                        else:
+                            st.caption("No edges returned.")
+                    else:
+                        st.warning("⚠️ Could not fetch model details for preview.")
+                except Exception as detail_err:
+                    st.warning(f"⚠️ Preview unavailable: {detail_err}")
+
+                if st.button("✅ Approve & Activate Model", key="approve"):
+                    with st.spinner("Approving…"):
+                        try:
+                            ar = requests.post(
+                                f"{API}/mode1/approve",
+                                json={"domain": task["domain"], "approved_by": "prototype_user"},
+                                timeout=30,
+                            )
+                            if ar.status_code == 200:
+                                ad = ar.json()
+                                st.success(
+                                    f"✅ Model **{ad.get('version_id', '')}** approved!  "
+                                    f"{ad.get('node_count', '?')} nodes, "
+                                    f"{ad.get('edge_count', '?')} edges — "
+                                    f"status **{ad.get('status', '?')}**"
                                 )
-                                if ar.status_code == 200:
-                                    ad = ar.json()
-                                    st.success(
-                                        f"✅ Model **{ad.get('version_id', '')}** approved!  "
-                                        f"{ad.get('node_count', '?')} nodes, "
-                                        f"{ad.get('edge_count', '?')} edges — "
-                                        f"status **{ad.get('status', '?')}**"
-                                    )
-                                    st.json(ad)
-                                else:
-                                    st.error(f"❌ Approval failed ({ar.status_code}): {ar.text}")
-                            except Exception as exc:
-                                st.error(f"❌ Error approving: {exc}")
-            else:
-                status_text.error(f"❌ API returned {resp.status_code}: {resp.text[:300]}")
+                                st.json(ad)
+                            else:
+                                st.error(f"❌ Approval failed ({ar.status_code}): {ar.text}")
+                        except Exception as exc:
+                            st.error(f"❌ Error approving: {exc}")
         else:
-            status_text.error("❌ Unexpected error — no response received.")
+            status_text.error(f"❌ API returned {resp.status_code}: {resp.text[:300]}")
+    else:
+        status_text.error("❌ Unexpected error — no response received.")
+
+    # Clear finished task so the page is ready for the next run.
+    st.session_state.pop(TASK_KEY, None)
 
 # ── Previously built models ─────────────────────────────────────
 if st.session_state.get("world_models"):

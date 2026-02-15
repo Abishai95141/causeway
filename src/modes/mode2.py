@@ -197,9 +197,16 @@ class Mode2DecisionSupport:
         try:
             # Stage 1: Query Parsing
             self._current_stage = Mode2Stage.QUERY_PARSING
-            parsed = await self._parse_query(query)
+            available_domains = self.causal.list_domains()
+            parsed = await self._parse_query(query, available_domains=available_domains or None)
             domain = domain_hint or parsed.domain
-            
+
+            # Fuzzy-resolve domain against what actually exists
+            if domain not in available_domains and available_domains:
+                resolved = self._resolve_domain(domain, available_domains)
+                if resolved:
+                    domain = resolved
+
             audit_entries.append(self._create_audit(
                 trace_id, "query_parsed",
                 {"domain": domain, "intervention": parsed.intervention}
@@ -209,7 +216,7 @@ class Mode2DecisionSupport:
             self._current_stage = Mode2Stage.MODEL_RETRIEVAL
             
             # Check if we have a world model for this domain
-            if domain not in self.causal.list_domains():
+            if domain not in available_domains:
                 # Escalate to Mode 1
                 return Mode2Result(
                     trace_id=trace_id,
@@ -365,14 +372,30 @@ class Mode2DecisionSupport:
                 audit_entries=audit_entries,
             )
     
-    async def _parse_query(self, query: str) -> ParsedQuery:
-        """Parse the decision query using LangExtract."""
+    async def _parse_query(
+        self,
+        query: str,
+        available_domains: list[str] | None = None,
+    ) -> ParsedQuery:
+        """Parse the decision query using LangExtract.
+
+        If *available_domains* is provided the prompt is augmented so the
+        LLM picks a domain from the known list instead of hallucinating.
+        """
         from src.config import get_settings
         api_key = get_settings().google_ai_api_key
 
+        prompt = self.QUERY_EXTRACT_PROMPT
+        if available_domains:
+            prompt += (
+                f"\n\nCRITICAL CONSTRAINT: The 'domain' attribute MUST be "
+                f"one of these available domains: {', '.join(available_domains)}. "
+                f"Pick the single best match for the user's query."
+            )
+
         result = lx.extract(
             text_or_documents=query,
-            prompt_description=self.QUERY_EXTRACT_PROMPT,
+            prompt_description=prompt,
             examples=self.QUERY_EXTRACT_EXAMPLES,
             model_id="gemini-2.5-flash",
             api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
@@ -560,6 +583,42 @@ class Mode2DecisionSupport:
     # _extract_parsed_query and _extract_recommendation have been
     # replaced by LangExtract structured extraction (see _parse_query
     # and _synthesize_recommendation).  No regex-based JSON parsing remains.
+
+    @staticmethod
+    def _resolve_domain(parsed_domain: str, available_domains: list[str]) -> Optional[str]:
+        """Fuzzy-match *parsed_domain* to the closest entry in *available_domains*.
+
+        Tries, in order:
+        1. Case-insensitive exact match
+        2. Substring / overlap (e.g. 'egg production' ∩ 'hobby_farm')
+        3. Word-overlap between the parsed domain and domain variable names
+        4. If exactly one domain exists, return it as the default
+        """
+        target = parsed_domain.lower().replace("_", " ")
+
+        # 1. Case-insensitive exact
+        for d in available_domains:
+            if d.lower() == target:
+                return d
+
+        # 2. Substring containment either way
+        for d in available_domains:
+            d_lower = d.lower().replace("_", " ")
+            if d_lower in target or target in d_lower:
+                return d
+
+        # 3. Any shared word (tokens of 3+ chars)
+        target_words = {w for w in target.split() if len(w) >= 3}
+        for d in available_domains:
+            d_words = {w for w in d.lower().replace("_", " ").split() if len(w) >= 3}
+            if target_words & d_words:
+                return d
+
+        # 4. Sole domain fallback
+        if len(available_domains) == 1:
+            return available_domains[0]
+
+        return None
 
     def _find_matching_variable(
         self,

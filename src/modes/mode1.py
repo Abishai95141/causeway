@@ -285,6 +285,7 @@ class Mode1WorldModelConstruction:
         initial_query: str,
         max_variables: int = 20,
         max_edges: int = 50,
+        doc_ids: list[str] | None = None,
     ) -> Mode1Result:
         """
         Run full Mode 1 workflow.
@@ -294,6 +295,8 @@ class Mode1WorldModelConstruction:
             initial_query: Starting query for evidence gathering
             max_variables: Maximum variables to discover
             max_edges: Maximum edges to create
+            doc_ids: Optional list of document IDs to restrict retrieval to.
+                     When provided, only evidence from these documents is used.
             
         Returns:
             Mode1Result with world model and audit trail
@@ -308,7 +311,7 @@ class Mode1WorldModelConstruction:
                 trace_id, "variable_discovery_start", {"domain": domain}
             ))
             
-            variables = await self._discover_variables(domain, initial_query, max_variables)
+            variables = await self._discover_variables(domain, initial_query, max_variables, doc_ids=doc_ids)
             audit_entries.append(self._create_audit(
                 trace_id, "variable_discovery_complete", 
                 {"count": len(variables)}
@@ -316,7 +319,7 @@ class Mode1WorldModelConstruction:
             
             # Stage 2: Evidence Gathering
             self._current_stage = Mode1Stage.EVIDENCE_GATHERING
-            evidence_map = await self._gather_evidence(variables)
+            evidence_map = await self._gather_evidence(variables, doc_ids=doc_ids)
             audit_entries.append(self._create_audit(
                 trace_id, "evidence_gathering_complete",
                 {"evidence_count": len(self._evidence_cache)}
@@ -488,6 +491,7 @@ class Mode1WorldModelConstruction:
         domain: str,
         query: str,
         max_variables: int,
+        doc_ids: list[str] | None = None,
     ) -> list[VariableCandidate]:
         """Discover causal variables from evidence using LangExtract."""
         # Phase 2: use hybrid retrieval for better recall
@@ -496,6 +500,7 @@ class Mode1WorldModelConstruction:
             strategy=RetrievalStrategy.HYBRID,
             max_results=10,
             use_reranking=True,
+            doc_ids=doc_ids,
         )
         evidence = await self.retrieval.retrieve(request)
 
@@ -516,6 +521,7 @@ class Mode1WorldModelConstruction:
                 strategy=RetrievalStrategy.HYBRID,
                 max_results=10,
                 use_reranking=True,
+                doc_ids=doc_ids,
             )
             broader_evidence = await self.retrieval.retrieve(broader_request)
             seen = {e.content_hash for e in evidence}
@@ -592,6 +598,7 @@ class Mode1WorldModelConstruction:
     async def _gather_evidence(
         self,
         variables: list[VariableCandidate],
+        doc_ids: list[str] | None = None,
     ) -> dict[str, list[EvidenceBundle]]:
         """Gather additional evidence for each variable using hybrid retrieval."""
         evidence_map: dict[str, list[EvidenceBundle]] = {}
@@ -604,6 +611,7 @@ class Mode1WorldModelConstruction:
                 strategy=RetrievalStrategy.HYBRID,
                 max_results=3,
                 use_reranking=True,
+                doc_ids=doc_ids,
             )
             bundles = await self.retrieval.retrieve(request)
             

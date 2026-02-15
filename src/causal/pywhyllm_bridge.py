@@ -33,6 +33,67 @@ from src.models.evidence import EvidenceBundle
 
 _logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Non-streaming wrapper — works around httpx 0.28.x sync/async close bug
+# ---------------------------------------------------------------------------
+# guidance 0.3.1 calls ``streaming_chat_completions`` and iterates the
+# returned ``Stream[ChatCompletionChunk]``.  When httpx ≥ 0.28 is
+# installed the openai SDK's streaming response wraps an async transport
+# stream that cannot be ``.close()``-d synchronously, raising:
+#   RuntimeError: Attempted to call an sync close on an async stream
+#
+# We avoid the issue entirely by calling the OpenAI client with
+# ``stream=False`` and wrapping the single ``ChatCompletion`` object in
+# a thin adapter that yields one ``ChatCompletionChunk`` — exactly what
+# guidance's ``_handle_stream`` expects.
+# ---------------------------------------------------------------------------
+
+class _SingleCompletionStream:
+    """Wrap a non-streaming ``ChatCompletion`` to look like a ``Stream[ChatCompletionChunk]``."""
+
+    def __init__(self, completion):
+        self._completion = completion
+        self._consumed = False
+
+    def __iter__(self):
+        if not self._consumed:
+            self._consumed = True
+            from openai.types.chat import ChatCompletionChunk
+            from openai.types.chat.chat_completion_chunk import (
+                Choice as ChunkChoice,
+                ChoiceDelta,
+            )
+
+            chunk = ChatCompletionChunk(
+                id=self._completion.id,
+                choices=[
+                    ChunkChoice(
+                        index=c.index,
+                        delta=ChoiceDelta(
+                            content=c.message.content,
+                            role=c.message.role,
+                        ),
+                        finish_reason=c.finish_reason,
+                    )
+                    for c in self._completion.choices
+                ],
+                created=self._completion.created,
+                model=self._completion.model,
+                object="chat.completion.chunk",
+            )
+            yield chunk
+
+    def close(self):
+        pass  # nothing to close — response was fully consumed
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
 # Gemini OpenAI-compatible endpoint
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 GEMINI_OPENAI_MODEL = "gemini-2.5-flash"
@@ -136,20 +197,23 @@ class CausalGraphBridge:
             # passes them through ``OpenAIClientWrapper.streaming_chat_completions``
             # → openai.Client.chat.completions.create(), so we monkey-patch
             # the wrapper's method to strip those keys before they hit the wire.
-            _orig_scc = llm._interpreter.client.streaming_chat_completions
+            #
+            # Additionally we use stream=False to avoid the httpx 0.28.x bug
+            # where guidance tries to synchronously close an async stream.
+            # The result is wrapped in _SingleCompletionStream so guidance's
+            # _handle_stream can iterate it normally.
 
             def _patched_scc(model, messages, logprobs=False, **kwargs):
                 kwargs.pop("top_logprobs", None)
-                # Call the original but with logprobs stripped from kwargs
-                # The original passes logprobs to openai client, so we need to
-                # directly call the openai client without logprobs
-                return llm._interpreter.client.client.chat.completions.create(
+                kwargs.pop("stream", None)
+                kwargs.pop("stream_options", None)
+                completion = llm._interpreter.client.client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    stream=True,
-                    stream_options={"include_usage": True},
+                    stream=False,
                     **kwargs,
                 )
+                return _SingleCompletionStream(completion)
 
             llm._interpreter.client.streaming_chat_completions = _patched_scc
 
@@ -205,6 +269,58 @@ class CausalGraphBridge:
 
         # -- Step 1: pairwise relationship suggestion via PyWhyLLM ----------
         try:
+            # PyWhyLLM's original suggest_pairwise_relationship does
+            # ``assert False`` if the LLM answer doesn't match A/B/C.
+            # We replace it with a safe version that returns "no relationship"
+            # instead of crashing.
+            _orig_spr = self._suggester.suggest_pairwise_relationship
+
+            def _safe_suggest_pairwise(var1, var2):
+                """Safe wrapper — graceful fallback instead of hard assert."""
+                lm = self._suggester.llm
+                from guidance import system, user, assistant, gen
+                from inspect import cleandoc
+
+                with system():
+                    lm += "You are a helpful assistant for causal reasoning."
+                with user():
+                    prompt_str = (
+                        f"Which cause-and-effect-relationship is more likely? "
+                        f"Provide reasoning and give your final answer (A, B, "
+                        f"or C) in <answer> </answer> tags with the letter only "
+                        f"and no whitespaces.\n"
+                        f"A. {var1} causes {var2} "
+                        f"B. {var2} causes {var1} "
+                        f"C. neither {var1} nor {var2} cause each other."
+                    )
+                    lm += cleandoc(prompt_str)
+                with assistant():
+                    lm += gen("description")
+
+                description = lm["description"]
+                _logger.debug(
+                    "PyWhyLLM pairwise (%s, %s) → description=%r",
+                    var1, var2, (description or "")[:200],
+                )
+                answer = re.findall(r'<answer>(.*?)</answer>', description or "")
+                answer = [ans.strip() for ans in answer]
+                answer_str = "".join(answer)
+
+                if answer_str == "A":
+                    return [var1, var2, description]
+                elif answer_str == "B":
+                    return [var2, var1, description]
+                elif answer_str == "C":
+                    return [None, None, description]
+                else:
+                    _logger.warning(
+                        "PyWhyLLM answer not A/B/C for (%s, %s): %r — treating as no relationship",
+                        var1, var2, answer_str,
+                    )
+                    return [None, None, description]
+
+            self._suggester.suggest_pairwise_relationship = _safe_suggest_pairwise
+
             relationships: dict[tuple[str, str], str] = (
                 self._suggester.suggest_relationships(variables)
             )

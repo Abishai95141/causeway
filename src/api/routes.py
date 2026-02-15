@@ -154,6 +154,7 @@ class Mode1Request(BaseModel):
     initial_query: str = Field(..., description="Starting query for evidence")
     max_variables: int = Field(default=20, ge=1, le=100)
     max_edges: int = Field(default=50, ge=1, le=200)
+    doc_ids: Optional[list[str]] = Field(default=None, description="Restrict evidence to these document IDs")
 
 
 class Mode1Response(BaseModel):
@@ -202,6 +203,35 @@ class ApprovalRequest(BaseModel):
     """Request to approve a world model."""
     domain: str
     approved_by: str
+
+
+# ── Rich detail models for human review ──────────────────────────
+
+class VariableDetail(BaseModel):
+    """Full variable info for human review."""
+    variable_id: str
+    name: str
+    definition: str
+    var_type: Optional[str] = None
+    role: Optional[str] = None
+
+class EdgeDetail(BaseModel):
+    """Full edge info for human review."""
+    from_var: str
+    to_var: str
+    mechanism: str
+    strength: Optional[str] = None
+    confidence: Optional[float] = None
+
+class WorldModelDetail(BaseModel):
+    """Rich model detail including variable/edge definitions."""
+    domain: str
+    version_id: Optional[str] = None
+    node_count: int
+    edge_count: int
+    status: str
+    variables: list[VariableDetail]
+    edges: list[EdgeDetail]
 
 
 # ===== Search Endpoint =====
@@ -497,6 +527,37 @@ async def index_document(doc_id: str, request: Optional[IndexRequest] = None):
         )
 
 
+# ===== Document list =====
+
+class DocumentListItem(BaseModel):
+    """Summary of a document for listing."""
+    doc_id: str
+    filename: str
+    status: str
+
+@router.get("/documents", response_model=list[DocumentListItem])
+async def list_documents():
+    """List all known documents with their ingestion status."""
+    try:
+        async with get_db_session() as session:
+            from sqlalchemy import select
+            from src.storage.database import DocumentRecordDB
+            rows = (await session.execute(
+                select(DocumentRecordDB).order_by(DocumentRecordDB.created_at.desc())
+            )).scalars().all()
+            return [
+                DocumentListItem(
+                    doc_id=f"doc_{row.doc_id.hex[:12]}",
+                    filename=row.filename,
+                    status=row.ingestion_status,
+                )
+                for row in rows
+            ]
+    except Exception as exc:
+        logger.warning("list_documents DB error: %s", exc)
+        return []
+
+
 # ===== Mode 1 Endpoints =====
 
 @router.post("/mode1/run", response_model=Mode1Response)
@@ -513,6 +574,7 @@ async def run_mode1(request: Mode1Request):
         initial_query=request.initial_query,
         max_variables=request.max_variables,
         max_edges=request.max_edges,
+        doc_ids=request.doc_ids,
     )
     
     return Mode1Response(
@@ -684,6 +746,89 @@ async def get_world_model(domain: str):
                 )
     except Exception as exc:
         logger.warning("DB world-model lookup failed: %s", exc)
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"World model not found: {domain}",
+    )
+
+
+@router.get("/world-models/{domain}/detail", response_model=WorldModelDetail)
+async def get_world_model_detail(domain: str):
+    """Return full variable definitions and edge details for human review."""
+    causal = get_causal_service()
+
+    # Try in-memory first
+    if domain in causal.list_domains():
+        engine = causal.get_engine(domain)
+        return WorldModelDetail(
+            domain=domain,
+            node_count=engine.node_count,
+            edge_count=engine.edge_count,
+            status="draft",
+            variables=[
+                VariableDetail(
+                    variable_id=v.variable_id,
+                    name=v.name,
+                    definition=v.definition,
+                    var_type=v.type.value if v.type else None,
+                    role=v.role.value if v.role else None,
+                )
+                for v in engine.variables
+            ],
+            edges=[
+                EdgeDetail(
+                    from_var=e.from_var,
+                    to_var=e.to_var,
+                    mechanism=e.metadata.mechanism if e.metadata else "",
+                    strength=e.metadata.evidence_strength.value if e.metadata and e.metadata.evidence_strength else None,
+                    confidence=e.metadata.confidence if e.metadata else None,
+                )
+                for e in engine.edges
+            ],
+        )
+
+    # Fallback: try PostgreSQL
+    try:
+        async with get_db_session() as session:
+            from sqlalchemy import select
+            from src.storage.database import WorldModelVersionDB
+            result = await session.execute(
+                select(WorldModelVersionDB)
+                .where(WorldModelVersionDB.domain == domain)
+                .order_by(WorldModelVersionDB.created_at.desc())
+            )
+            wm = result.scalars().first()
+            if wm:
+                var_details = []
+                for vid, vdata in (wm.variables or {}).items():
+                    var_details.append(VariableDetail(
+                        variable_id=vid,
+                        name=vdata.get("name", vid),
+                        definition=vdata.get("definition", ""),
+                        var_type=vdata.get("variable_type"),
+                        role=vdata.get("role"),
+                    ))
+                edge_details = []
+                for edata in (wm.edges or []):
+                    edge_details.append(EdgeDetail(
+                        from_var=edata["from_var"],
+                        to_var=edata["to_var"],
+                        mechanism=edata.get("mechanism", ""),
+                        strength=edata.get("strength"),
+                        confidence=edata.get("confidence"),
+                    ))
+                return WorldModelDetail(
+                    domain=domain,
+                    version_id=wm.version_id,
+                    node_count=len(var_details),
+                    edge_count=len(edge_details),
+                    status=wm.status or "draft",
+                    variables=var_details,
+                    edges=edge_details,
+                )
+    except Exception as exc:
+        logger.warning("DB world-model detail lookup failed: %s", exc)
 
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
