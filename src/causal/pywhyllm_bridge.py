@@ -18,6 +18,8 @@ from __future__ import annotations
 import itertools
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import UUID
@@ -268,15 +270,24 @@ class CausalGraphBridge:
         result = BridgeResult()
 
         # -- Step 1: pairwise relationship suggestion via PyWhyLLM ----------
-        try:
-            # PyWhyLLM's original suggest_pairwise_relationship does
-            # ``assert False`` if the LLM answer doesn't match A/B/C.
-            # We replace it with a safe version that returns "no relationship"
-            # instead of crashing.
-            _orig_spr = self._suggester.suggest_pairwise_relationship
+        #
+        # Previous implementation delegated to PyWhyLLM's sequential
+        # ``suggest_relationships()`` which checked every variable pair
+        # one-at-a-time.  For 15 variables that's C(15,2) = 105 serial
+        # Gemini API calls — an O(n²) bottleneck taking several minutes.
+        #
+        # We now build the same ``_safe_suggest_pairwise`` worker but
+        # fan-out the I/O-bound calls across a ThreadPoolExecutor.
+        # Workers return plain tuples; graph mutation stays on the main
+        # thread for safety.
+        # ------------------------------------------------------------------
 
-            def _safe_suggest_pairwise(var1, var2):
-                """Safe wrapper — graceful fallback instead of hard assert."""
+        MAX_WORKERS = 10  # stay under Gemini per-minute rate limits
+
+        try:
+            # Build the safe pairwise checker (same logic as before)
+            def _safe_suggest_pairwise(var1: str, var2: str) -> tuple[str | None, str | None, str]:
+                """Thread-safe worker — performs ONE API call, returns a plain tuple."""
                 lm = self._suggester.llm
                 from guidance import system, user, assistant, gen
                 from inspect import cleandoc
@@ -307,23 +318,73 @@ class CausalGraphBridge:
                 answer_str = "".join(answer)
 
                 if answer_str == "A":
-                    return [var1, var2, description]
+                    return (var1, var2, description)
                 elif answer_str == "B":
-                    return [var2, var1, description]
+                    return (var2, var1, description)
                 elif answer_str == "C":
-                    return [None, None, description]
+                    return (None, None, description)
                 else:
                     _logger.warning(
                         "PyWhyLLM answer not A/B/C for (%s, %s): %r — treating as no relationship",
                         var1, var2, answer_str,
                     )
-                    return [None, None, description]
+                    return (None, None, description)
 
-            self._suggester.suggest_pairwise_relationship = _safe_suggest_pairwise
-
-            relationships: dict[tuple[str, str], str] = (
-                self._suggester.suggest_relationships(variables)
+            # Enumerate all unique pairs
+            pairs = list(itertools.combinations(variables, 2))
+            total_pairs = len(pairs)
+            _logger.info(
+                "PyWhyLLM: checking %d variable pairs concurrently (max_workers=%d)",
+                total_pairs, MAX_WORKERS,
             )
+            t0 = time.monotonic()
+
+            relationships: dict[tuple[str, str], str] = {}
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_pair = {
+                    executor.submit(_safe_suggest_pairwise, v1, v2): (v1, v2)
+                    for v1, v2 in pairs
+                }
+
+                completed = 0
+                for future in as_completed(future_to_pair):
+                    v1, v2 = future_to_pair[future]
+                    completed += 1
+                    try:
+                        from_var, to_var, description = future.result()
+                        if from_var is not None:
+                            relationships[(from_var, to_var)] = description
+                            _logger.debug(
+                                "[%d/%d] %s → %s",
+                                completed, total_pairs, from_var, to_var,
+                            )
+                        else:
+                            _logger.debug(
+                                "[%d/%d] No relationship: %s ↔ %s",
+                                completed, total_pairs, v1, v2,
+                            )
+                    except Exception as exc:
+                        _logger.warning(
+                            "[%d/%d] Pair (%s, %s) failed: %s",
+                            completed, total_pairs, v1, v2, exc,
+                        )
+
+                    # Progress log every 20 completions
+                    if completed % 20 == 0 or completed == total_pairs:
+                        elapsed = time.monotonic() - t0
+                        _logger.info(
+                            "PyWhyLLM progress: %d/%d pairs checked (%.1fs elapsed)",
+                            completed, total_pairs, elapsed,
+                        )
+
+            elapsed = time.monotonic() - t0
+            _logger.info(
+                "PyWhyLLM: %d pairs completed in %.1fs — %d edges found (was ~%.0fs sequential)",
+                total_pairs, elapsed, len(relationships),
+                total_pairs * 2.0,  # rough estimate of old serial time
+            )
+
         except Exception as exc:
             _logger.warning("PyWhyLLM suggest_relationships failed: %s", exc)
             result.warnings.append(f"PyWhyLLM relationship suggestion failed: {exc}")
