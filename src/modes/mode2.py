@@ -14,6 +14,10 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from uuid import UUID, uuid4
 from enum import Enum
+import os
+import textwrap
+
+import langextract as lx
 
 from src.agent.llm_client import LLMClient
 from src.causal.service import CausalService
@@ -97,44 +101,60 @@ class Mode2DecisionSupport:
     - Confidence-scored recommendations
     """
     
-    QUERY_PARSING_PROMPT = """Analyze this decision query and extract:
-- domain: The decision domain (e.g., pricing, marketing, operations)
-- intervention: The action being considered
-- target_outcome: The outcome to optimize
-- constraints: Any constraints mentioned
+    # ── LangExtract prompt descriptions ────────────────────────────
 
-Query: {query}
+    QUERY_EXTRACT_PROMPT = textwrap.dedent("""\
+        Extract the decision query components from the text: the business
+        domain, the proposed intervention (action being considered), the
+        target outcome to optimise, and any constraints mentioned.
+        Use exact phrases from the text.""")
 
-Respond with JSON:
-```json
-{{"domain": "...", "intervention": "...", "target_outcome": "...", "constraints": ["..."]}}
-```"""
+    QUERY_EXTRACT_EXAMPLES = [
+        lx.data.ExampleData(
+            text="Should we increase prices to boost revenue while staying within budget?",
+            extractions=[
+                lx.data.Extraction(
+                    extraction_class="decision_query",
+                    extraction_text="increase prices to boost revenue",
+                    attributes={
+                        "domain": "pricing",
+                        "intervention": "increase prices",
+                        "target_outcome": "revenue",
+                        "constraints": "staying within budget",
+                    },
+                ),
+            ],
+        ),
+    ]
 
-    RECOMMENDATION_PROMPT = """Based on the causal analysis and evidence, provide a recommendation.
+    RECOMMENDATION_EXTRACT_PROMPT = textwrap.dedent("""\
+        Extract recommendation claims from the causal analysis and evidence.
+        Each claim should be grounded in exact text from the evidence.
+        Attributes must include the recommendation, confidence level,
+        reasoning, suggested actions, and risks.""")
 
-Query: {query}
-
-Causal Analysis:
-- Intervention: {intervention}
-- Target Outcome: {outcome}
-- Causal Paths: {paths}
-- Confounders to consider: {confounders}
-- Mediating variables: {mediators}
-
-Supporting Evidence:
-{evidence}
-
-Provide your recommendation as JSON:
-```json
-{{
-  "recommendation": "Your main recommendation",
-  "confidence": "high/medium/low",
-  "reasoning": "Why this recommendation",
-  "actions": ["Specific action 1", "Specific action 2"],
-  "risks": ["Risk 1", "Risk 2"],
-  "evidence_refs": ["evidence_id_1", "evidence_id_2"]
-}}
-```"""
+    RECOMMENDATION_EXTRACT_EXAMPLES = [
+        lx.data.ExampleData(
+            text=(
+                "Analysis shows price increases reduce demand through elasticity. "
+                "Revenue impact is positive when demand drop is below 15%. "
+                "Risk: competitor under-cutting may negate gains."
+            ),
+            extractions=[
+                lx.data.Extraction(
+                    extraction_class="recommendation_claim",
+                    extraction_text="price increases reduce demand through elasticity",
+                    attributes={
+                        "recommendation": "Implement moderate price increase of 5-10%",
+                        "confidence": "medium",
+                        "reasoning": "Elasticity effect is present but manageable",
+                        "actions": "Raise prices gradually, monitor demand weekly",
+                        "risks": "Competitor under-cutting may negate gains",
+                    },
+                ),
+            ],
+        ),
+    ]
 
     def __init__(
         self,
@@ -346,12 +366,39 @@ Provide your recommendation as JSON:
             )
     
     async def _parse_query(self, query: str) -> ParsedQuery:
-        """Parse the decision query to extract components."""
-        prompt = self.QUERY_PARSING_PROMPT.format(query=query)
-        response = await self.llm.generate(prompt)
-        
-        parsed = self._extract_parsed_query(response.content)
-        return parsed
+        """Parse the decision query using LangExtract."""
+        from src.config import get_settings
+        api_key = get_settings().google_ai_api_key
+
+        result = lx.extract(
+            text_or_documents=query,
+            prompt_description=self.QUERY_EXTRACT_PROMPT,
+            examples=self.QUERY_EXTRACT_EXAMPLES,
+            model_id="gemini-2.5-flash",
+            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
+            show_progress=False,
+        )
+
+        for ext in (result.extractions or []):
+            if ext.extraction_class == "decision_query":
+                attrs = ext.attributes or {}
+                return ParsedQuery(
+                    domain=attrs.get("domain", "general"),
+                    intervention=attrs.get("intervention", "unknown action"),
+                    target_outcome=attrs.get("target_outcome", "unknown outcome"),
+                    constraints=(
+                        [c.strip() for c in attrs.get("constraints", "").split(",")]
+                        if attrs.get("constraints")
+                        else []
+                    ),
+                )
+
+        # Fallback if LangExtract finds nothing
+        return ParsedQuery(
+            domain="general",
+            intervention="the proposed action",
+            target_outcome="business outcomes",
+        )
     
     async def _refresh_evidence(
         self,
@@ -417,12 +464,12 @@ Provide your recommendation as JSON:
         insights: list[CausalInsight],
         evidence: list[EvidenceBundle],
     ) -> DecisionRecommendation:
-        """Synthesize final recommendation using LLM."""
-        # Format causal insights
+        """Synthesize recommendation using LangExtract with grounded evidence."""
+        # Build analysis context text for LangExtract
         paths_text = "No causal paths found in model"
         confounders_text = "None identified"
         mediators_text = "None identified"
-        
+
         if insights:
             insight = insights[0]
             paths_text = insight.path_description
@@ -430,91 +477,78 @@ Provide your recommendation as JSON:
                 confounders_text = ", ".join(insight.confounders)
             if insight.mediators:
                 mediators_text = ", ".join(insight.mediators)
-        
-        # Format evidence
-        evidence_text = "\n".join([
-            f"[{e.content_hash[:8]}] {e.content[:300]}"
-            for e in evidence[:3]
-        ])
-        
-        prompt = self.RECOMMENDATION_PROMPT.format(
-            query=query,
-            intervention=parsed.intervention,
-            outcome=parsed.target_outcome,
-            paths=paths_text,
-            confounders=confounders_text,
-            mediators=mediators_text,
-            evidence=evidence_text,
+
+        evidence_text = "\n\n".join(
+            e.content[:400] for e in evidence[:5]
         )
-        
-        response = await self.llm.generate(prompt)
-        recommendation = self._extract_recommendation(response.content, evidence)
-        
-        return recommendation
-    
-    def _extract_parsed_query(self, content: str) -> ParsedQuery:
-        """Extract parsed query from LLM response."""
-        import json
-        import re
-        
-        # Extract JSON from response
-        json_match = re.search(r'\{[\s\S]*\}', content)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                return ParsedQuery(
-                    domain=data.get("domain", "general"),
-                    intervention=data.get("intervention", "unknown action"),
-                    target_outcome=data.get("target_outcome", "unknown outcome"),
-                    constraints=data.get("constraints", []),
-                )
-            except json.JSONDecodeError:
-                pass
-        
-        # Default parsing
-        return ParsedQuery(
-            domain="general",
-            intervention="the proposed action",
-            target_outcome="business outcomes",
+
+        full_text = (
+            f"Query: {query}\n"
+            f"Intervention: {parsed.intervention}\n"
+            f"Target Outcome: {parsed.target_outcome}\n"
+            f"Causal Paths: {paths_text}\n"
+            f"Confounders: {confounders_text}\n"
+            f"Mediators: {mediators_text}\n\n"
+            f"Evidence:\n{evidence_text}"
         )
-    
-    def _extract_recommendation(
-        self,
-        content: str,
-        evidence: list[EvidenceBundle],
-    ) -> DecisionRecommendation:
-        """Extract recommendation from LLM response."""
-        import json
-        import re
-        
-        # Extract JSON from response
-        json_match = re.search(r'\{[\s\S]*\}', content)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                
-                confidence_map = {
-                    "high": ConfidenceLevel.HIGH,
-                    "medium": ConfidenceLevel.MEDIUM,
-                    "low": ConfidenceLevel.LOW,
-                }
-                
-                return DecisionRecommendation(
-                    recommendation=data.get("recommendation", "Unable to provide recommendation"),
-                    confidence=confidence_map.get(
-                        data.get("confidence", "medium").lower(),
-                        ConfidenceLevel.MEDIUM
-                    ),
-                    expected_outcome=data.get("expected_outcome", data.get("reasoning", "")),
-                    suggested_actions=data.get("actions", []),
-                    risks=data.get("risks", []),
-                    evidence_refs=[],  # UUIDs from actual evidence bundles
-                )
-            except json.JSONDecodeError:
-                pass
-        
+
+        from src.config import get_settings
+        api_key = get_settings().google_ai_api_key
+
+        result = lx.extract(
+            text_or_documents=full_text,
+            prompt_description=self.RECOMMENDATION_EXTRACT_PROMPT,
+            examples=self.RECOMMENDATION_EXTRACT_EXAMPLES,
+            model_id="gemini-2.5-flash",
+            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
+            show_progress=False,
+        )
+
+        # Map extractions → DecisionRecommendation with grounded evidence refs
+        for ext in (result.extractions or []):
+            if ext.extraction_class != "recommendation_claim":
+                continue
+            attrs = ext.attributes or {}
+
+            # Provenance: match extraction_text to evidence bundles
+            grounded_ids: list[UUID] = []
+            quote = ext.extraction_text.lower()
+            for eb in evidence:
+                if quote in eb.content.lower():
+                    grounded_ids.append(eb.bundle_id)
+
+            confidence_map = {
+                "high": ConfidenceLevel.HIGH,
+                "medium": ConfidenceLevel.MEDIUM,
+                "low": ConfidenceLevel.LOW,
+            }
+
+            actions_raw = attrs.get("actions", "")
+            risks_raw = attrs.get("risks", "")
+
+            return DecisionRecommendation(
+                recommendation=attrs.get("recommendation", "Unable to provide recommendation"),
+                confidence=confidence_map.get(
+                    attrs.get("confidence", "medium").lower(),
+                    ConfidenceLevel.MEDIUM,
+                ),
+                expected_outcome=attrs.get("reasoning", ""),
+                suggested_actions=(
+                    [a.strip() for a in actions_raw.split(",")]
+                    if isinstance(actions_raw, str) and actions_raw
+                    else actions_raw if isinstance(actions_raw, list) else []
+                ),
+                risks=(
+                    [r.strip() for r in risks_raw.split(",")]
+                    if isinstance(risks_raw, str) and risks_raw
+                    else risks_raw if isinstance(risks_raw, list) else []
+                ),
+                evidence_refs=grounded_ids,
+            )
+
+        # Fallback
         return DecisionRecommendation(
-            recommendation="Unable to parse recommendation from analysis",
+            recommendation="Unable to synthesize recommendation from analysis",
             confidence=ConfidenceLevel.LOW,
             expected_outcome="Unknown",
             suggested_actions=[],
@@ -522,6 +556,11 @@ Provide your recommendation as JSON:
             evidence_refs=[],
         )
     
+    # ── Legacy regex extractors removed ─────────────────────────────
+    # _extract_parsed_query and _extract_recommendation have been
+    # replaced by LangExtract structured extraction (see _parse_query
+    # and _synthesize_recommendation).  No regex-based JSON parsing remains.
+
     def _find_matching_variable(
         self,
         term: str,

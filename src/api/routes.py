@@ -29,6 +29,7 @@ from src.modes.mode2 import Mode2DecisionSupport, Mode2Stage
 from src.causal.service import CausalService
 from src.protocol.state_machine import ProtocolStateMachine
 from src.protocol.mode_router import ModeRouter
+from src.agent.causeway_agent import CausewayAgent
 from src.models.enums import IngestionStatus, ModelStatus, OperatingMode
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ _mode1: Optional[Mode1WorldModelConstruction] = None
 _mode2: Optional[Mode2DecisionSupport] = None
 _protocol_sm: Optional[ProtocolStateMachine] = None
 _mode_router: Optional[ModeRouter] = None
+_causeway_agent: Optional[CausewayAgent] = None
 
 
 def get_protocol_sm() -> ProtocolStateMachine:
@@ -59,6 +61,19 @@ def get_mode_router() -> ModeRouter:
     if _mode_router is None:
         _mode_router = ModeRouter()
     return _mode_router
+
+
+async def get_causeway_agent() -> CausewayAgent:
+    """Get or create the CausewayAgent singleton (agentic entrypoint)."""
+    global _causeway_agent
+    if _causeway_agent is None:
+        _causeway_agent = CausewayAgent(
+            causal_service=get_causal_service(),
+            retrieval_router=await get_retrieval_router(),
+            mode_router=get_mode_router(),
+        )
+        await _causeway_agent.initialize()
+    return _causeway_agent
 
 
 async def get_object_store() -> ObjectStore:
@@ -697,78 +712,46 @@ class QueryResponse(BaseModel):
 @router.post("/query", response_model=QueryResponse)
 async def unified_query(request: QueryRequest):
     """
-    Unified entry point that auto-routes to Mode 1 or Mode 2
-    using the ProtocolStateMachine + ModeRouter.
-    """
-    sm = get_protocol_sm()
-    mr = get_mode_router()
+    Unified entry point — delegates to CausewayAgent which runs an
+    LLM-driven tool-calling loop instead of a fixed pipeline.
 
-    # Classify the query
-    decision = mr.route(request.query)
+    The agent uses ModeRouter internally to classify the query, then
+    registers mode-specific tools (and PageIndex navigation tools)
+    before handing control to the LLM.
+    """
+    agent = await get_causeway_agent()
 
     try:
-        async with sm.run(request.query, session_id=request.session_id) as ctx:
-            await sm.set_mode(decision.mode)
-
-            if decision.mode == OperatingMode.MODE_1:
-                mode1 = await get_mode1()
-                domain = decision.extracted_domain or "general"
-                m1_result = await mode1.run(
-                    domain=domain,
-                    initial_query=request.query,
-                )
-                await sm.complete_discovery()
-                ctx.result = {
-                    "trace_id": m1_result.trace_id,
-                    "domain": m1_result.domain,
-                    "stage": m1_result.stage.value,
-                    "variables_discovered": m1_result.variables_discovered,
-                    "edges_created": m1_result.edges_created,
-                    "requires_review": m1_result.requires_review,
-                    "error": m1_result.error,
-                }
-            else:
-                mode2 = await get_mode2()
-                m2_result = await mode2.run(
-                    query=request.query,
-                    domain_hint=decision.extracted_domain,
-                )
-                await sm.complete_decision_support()
-
-                rec_text = None
-                conf_text = None
-                if m2_result.recommendation:
-                    rec_text = m2_result.recommendation.recommendation
-                    conf_text = m2_result.recommendation.confidence.value
-
-                ctx.result = {
-                    "trace_id": m2_result.trace_id,
-                    "query": m2_result.query,
-                    "stage": m2_result.stage.value,
-                    "recommendation": rec_text,
-                    "confidence": conf_text,
-                    "evidence_count": m2_result.evidence_count,
-                    "escalate_to_mode1": m2_result.escalate_to_mode1,
-                    "error": m2_result.error,
-                }
+        result = await agent.run(
+            query=request.query,
+            session_id=request.session_id,
+        )
 
         return QueryResponse(
-            trace_id=ctx.trace_id,
-            routed_mode=decision.mode.value,
-            confidence=decision.confidence,
-            route_reason=decision.reason.value,
-            result=ctx.result or {},
+            trace_id=result.trace_id,
+            routed_mode=result.routed_mode,
+            confidence=result.route_confidence,
+            route_reason=result.route_reason,
+            result={
+                "response": result.response,
+                "tool_calls": len(result.tool_calls),
+                "total_tokens": result.total_tokens,
+                "escalate_to_mode1": result.escalate_to_mode1,
+                "escalation_reason": result.escalation_reason,
+            },
+            error=result.error,
         )
 
     except Exception as exc:
         logger.error("Unified query failed: %s", exc)
         return QueryResponse(
             trace_id="error",
-            routed_mode=decision.mode.value,
-            confidence=decision.confidence,
-            route_reason=decision.reason.value,
+            routed_mode="unknown",
+            confidence=0.0,
+            route_reason="error",
             error=str(exc),
         )
+
 
 
 # ===== Protocol Status =====

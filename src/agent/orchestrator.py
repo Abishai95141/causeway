@@ -10,6 +10,7 @@ High-level orchestrator for LLM-driven operations:
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
@@ -52,6 +53,8 @@ class AgentOrchestrator:
     - Causal reasoning integration
     - Error handling and recovery
     """
+
+    _log = logging.getLogger("src.agent.orchestrator")
     
     def __init__(
         self,
@@ -131,10 +134,21 @@ class AgentOrchestrator:
                 # Check for tool calls
                 if response.tool_calls and iteration < self.max_tool_calls:
                     for tool_call in response.tool_calls:
+                        tc_name = tool_call.get("tool", "")
+                        tc_args = tool_call.get("arguments", {})
+                        self._log.info(
+                            "Tool call [iter=%d]: %s  args=%s",
+                            iteration, tc_name, str(tc_args)[:300],
+                        )
                         result = await self._execute_tool(
-                            tool_call.get("tool", ""),
-                            tool_call.get("arguments", {}),
+                            tc_name,
+                            tc_args,
                             trace_id=span_trace_id,
+                        )
+                        self._log.info(
+                            "Tool result [%s]: success=%s  result=%s",
+                            result.tool_name, result.success,
+                            str(result.result)[:300],
                         )
                         tool_results.append(result)
                         

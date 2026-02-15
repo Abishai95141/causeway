@@ -22,6 +22,10 @@ from typing import Any, Optional
 from uuid import UUID, uuid4
 from enum import Enum
 import logging
+import os
+import textwrap
+
+import langextract as lx
 
 from src.agent.orchestrator import AgentOrchestrator
 from src.agent.llm_client import LLMClient
@@ -119,98 +123,132 @@ class Mode1WorldModelConstruction:
     - Human approval workflow
     """
     
-    VARIABLE_DISCOVERY_PROMPT = """You are analyzing documents to identify ALL causal variables for a decision domain.
+    # ── LangExtract prompt descriptions ────────────────────────────────────
 
-Domain: {domain}
+    VARIABLE_EXTRACT_PROMPT = textwrap.dedent("""\
+        Extract every measurable causal variable mentioned or implied in the
+        evidence text.  A causal model typically needs 8-15 variables.
+        Think across categories: inputs, processes, outputs, quality,
+        demand, satisfaction, competition, and environment.
+        Use exact phrases from the text for extraction_text.  Do not
+        paraphrase or overlap entities.""")
 
-TASK: Read the evidence below and extract EVERY measurable variable mentioned or implied.
-A causal model needs MANY variables to be useful — typically 8-15.
+    VARIABLE_EXTRACT_EXAMPLES = [
+        lx.data.ExampleData(
+            text=(
+                "Higher staff training hours improved barista skill levels. "
+                "Seasonal foot traffic drives daily customer volume. "
+                "Specialty drink pricing is set above competitor averages."
+            ),
+            extractions=[
+                lx.data.Extraction(
+                    extraction_class="variable",
+                    extraction_text="staff training hours",
+                    attributes={
+                        "type": "continuous",
+                        "measurement_status": "measured",
+                        "description": "Hours of barista training per quarter",
+                    },
+                ),
+                lx.data.Extraction(
+                    extraction_class="variable",
+                    extraction_text="barista skill levels",
+                    attributes={
+                        "type": "continuous",
+                        "measurement_status": "observable",
+                        "description": "Assessed proficiency of barista staff",
+                    },
+                ),
+                lx.data.Extraction(
+                    extraction_class="variable",
+                    extraction_text="Seasonal foot traffic",
+                    attributes={
+                        "type": "continuous",
+                        "measurement_status": "measured",
+                        "description": "Pedestrian volume influenced by season",
+                    },
+                ),
+                lx.data.Extraction(
+                    extraction_class="variable",
+                    extraction_text="daily customer volume",
+                    attributes={
+                        "type": "continuous",
+                        "measurement_status": "measured",
+                        "description": "Number of customers visiting per day",
+                    },
+                ),
+                lx.data.Extraction(
+                    extraction_class="variable",
+                    extraction_text="Specialty drink pricing",
+                    attributes={
+                        "type": "continuous",
+                        "measurement_status": "measured",
+                        "description": "Price point for specialty beverages",
+                    },
+                ),
+                lx.data.Extraction(
+                    extraction_class="variable",
+                    extraction_text="competitor averages",
+                    attributes={
+                        "type": "continuous",
+                        "measurement_status": "observable",
+                        "description": "Average competitor pricing in the area",
+                    },
+                ),
+            ],
+        )
+    ]
 
-Think through these categories and extract variables from each:
-1. INPUTS: resources, costs, investments, staffing, materials
-2. PROCESSES: operations, methods, techniques, strategies
-3. OUTPUTS: revenue, production, performance metrics
-4. QUALITY: product quality, service quality, standards
-5. DEMAND: customer traffic, market size, seasonal factors
-6. SATISFACTION: customer satisfaction, retention, loyalty
-7. COMPETITION: competitor actions, market position
-8. ENVIRONMENT: location, regulations, economic conditions
+    EDGE_EXTRACT_PROMPT = textwrap.dedent("""\
+        Extract every causal relationship between variables found in the
+        evidence text.  For each relationship use exact sentences or phrases
+        from the text as extraction_text — this is the proof that the
+        relationship exists.
+        Attributes must include from_var and to_var using snake_case IDs,
+        the causal mechanism, and evidence strength.
+        Consider ALL possible variable pairs; a useful model has many edges.""")
 
-For each variable provide:
-- variable_id: snake_case identifier (e.g., "employee_training_hours")
-- name: Human-readable name
-- description: What this variable represents and how it could be measured
-- type: continuous, discrete, binary, or categorical
-- measurement_status: measured, observable, or latent
-
-Evidence:
-{evidence}
-
-Return a JSON array with AT LEAST 8 variables. Include every factor mentioned in the evidence:
-```json
-[
-  {{"variable_id": "example_var", "name": "Example Variable", "description": "...", "type": "continuous", "measurement_status": "measured"}}
-]
-```"""
-
-    EVIDENCE_GROUNDED_DAG_PROMPT = """You are building a causal DAG for decision support.
-IMPORTANT: Every proposed edge MUST be grounded in the evidence provided below.
-Do NOT propose relationships based solely on general knowledge — cite specific evidence.
-
-Domain: {domain}
-
-Variables in the model (use these EXACT IDs as from_var / to_var):
-{variables}
-
-Available evidence (each prefixed with its hash ID):
-{evidence}
-
-TASK: Systematically consider ALL possible pairs of variables and identify
-causal relationships supported by the evidence. You should find MULTIPLE edges —
-a model with only 1 or 2 edges for 5+ variables is almost certainly incomplete.
-
-For each causal edge you propose, you MUST:
-1. Use the EXACT variable IDs listed above (the snake_case identifiers before the colon)
-2. Reference which evidence hash IDs support the relationship
-3. Describe the causal mechanism found in the evidence
-4. Note any assumptions required for this causal claim
-5. Rate strength based on evidence count: strong (3+ sources), moderate (2 sources), hypothesis (1 source)
-
-Respond with a JSON array of edges:
-```json
-[
-  {{
-    "from_var": "exact_variable_id",
-    "to_var": "exact_variable_id",
-    "mechanism": "...",
-    "strength": "hypothesis|moderate|strong",
-    "evidence_ids": ["hash1", "hash2"],
-    "assumptions": ["assumption 1", "assumption 2"]
-  }}
-]
-```"""
-
-    # Legacy prompt kept for fallback if bridge is unavailable
-    DAG_DRAFTING_PROMPT = """You are building a causal DAG for decision support.
-
-Domain: {domain}
-
-Variables in the model:
-{variables}
-
-Based on domain knowledge and the evidence, identify causal relationships between these variables.
-For each edge, provide:
-- from_var: Source variable ID (the cause)
-- to_var: Target variable ID (the effect)
-- mechanism: Explanation of how the cause affects the effect
-- strength: hypothesis, moderate, or strong
-
-Respond with a JSON array of edges:
-```json
-[
-  {{"from_var": "...", "to_var": "...", "mechanism": "...", "strength": "..."}}
-]
-```"""
+    EDGE_EXTRACT_EXAMPLES = [
+        lx.data.ExampleData(
+            text=(
+                "Higher staff training hours improved barista skill levels. "
+                "Better barista skills led to higher drink quality scores. "
+                "Seasonal foot traffic drives daily customer volume."
+            ),
+            extractions=[
+                lx.data.Extraction(
+                    extraction_class="causal_edge",
+                    extraction_text="Higher staff training hours improved barista skill levels",
+                    attributes={
+                        "from_var": "staff_training_hours",
+                        "to_var": "barista_skill_levels",
+                        "mechanism": "Training increases proficiency",
+                        "strength": "strong",
+                    },
+                ),
+                lx.data.Extraction(
+                    extraction_class="causal_edge",
+                    extraction_text="Better barista skills led to higher drink quality scores",
+                    attributes={
+                        "from_var": "barista_skill_levels",
+                        "to_var": "drink_quality_scores",
+                        "mechanism": "Skilled baristas produce better drinks",
+                        "strength": "moderate",
+                    },
+                ),
+                lx.data.Extraction(
+                    extraction_class="causal_edge",
+                    extraction_text="Seasonal foot traffic drives daily customer volume",
+                    attributes={
+                        "from_var": "seasonal_foot_traffic",
+                        "to_var": "daily_customer_volume",
+                        "mechanism": "More pedestrians means more walk-in customers",
+                        "strength": "strong",
+                    },
+                ),
+            ],
+        )
+    ]
 
     def __init__(
         self,
@@ -451,7 +489,7 @@ Respond with a JSON array of edges:
         query: str,
         max_variables: int,
     ) -> list[VariableCandidate]:
-        """Discover causal variables from evidence using hybrid retrieval."""
+        """Discover causal variables from evidence using LangExtract."""
         # Phase 2: use hybrid retrieval for better recall
         request = RetrievalRequest(
             query=query,
@@ -460,32 +498,18 @@ Respond with a JSON array of edges:
             use_reranking=True,
         )
         evidence = await self.retrieval.retrieve(request)
-        
+
         # Cache evidence
         for e in evidence:
             self._evidence_cache[e.content_hash[:12]] = e
-        
-        # Use LLM to identify variables
-        evidence_text = "\n\n".join([
-            f"[{e.content_hash[:8]}] {e.content[:500]}"
-            for e in evidence[:10]
-        ])
-        
-        prompt = self.VARIABLE_DISCOVERY_PROMPT.format(
-            domain=domain,
-            evidence=evidence_text,
+
+        # Build plain-text evidence document for LangExtract
+        evidence_text = "\n\n".join(
+            e.content[:500] for e in evidence[:10]
         )
-        
-        response = await self.llm.generate(prompt, temperature=0.3)
-        _logger.info("Variable discovery: LLM returned %d chars", len(response.content))
 
-        # Parse variables from response
-        variables = self._parse_variables(response.content)
-
-        # If too few variables found, retry with broader evidence and more explicit prompt
-        if len(variables) < 7 and len(evidence) >= 3:
-            _logger.info("Only %d variables found, retrying with broader evidence", len(variables))
-            # Get additional evidence with a different query angle
+        # If too little text, broaden the search
+        if len(evidence_text) < 200 and len(evidence) >= 1:
             broader_query = f"factors costs revenue quality operations competition in {domain}"
             broader_request = RetrievalRequest(
                 query=broader_query,
@@ -494,45 +518,73 @@ Respond with a JSON array of edges:
                 use_reranking=True,
             )
             broader_evidence = await self.retrieval.retrieve(broader_request)
-            # Merge evidence
-            all_evidence = list(evidence)
-            seen_hashes = {e.content_hash for e in evidence}
+            seen = {e.content_hash for e in evidence}
             for e in broader_evidence:
-                if e.content_hash not in seen_hashes:
-                    all_evidence.append(e)
-                    seen_hashes.add(e.content_hash)
+                if e.content_hash not in seen:
+                    evidence.append(e)
+                    seen.add(e.content_hash)
                     self._evidence_cache[e.content_hash[:12]] = e
-
-            broader_text = "\n\n".join([
-                f"[{e.content_hash[:8]}] {e.content[:500]}"
-                for e in all_evidence[:15]
-            ])
-            existing_names = [v.name for v in variables]
-            retry_prompt = (
-                f"I already found these variables: {existing_names}\n"
-                f"But there are MANY more causal factors in this evidence.\n\n"
-                f"Evidence:\n{broader_text}\n\n"
-                f"List ALL additional measurable variables from this evidence for "
-                f"a causal model of '{domain}'. Look for EVERY factor mentioned — "
-                f"costs, revenue, quality, satisfaction, traffic, location, marketing, "
-                f"competition, pricing, training, staffing, operations, etc.\n\n"
-                f"Return a JSON array of at least 6 NEW variables (not: {existing_names}):\n"
-                f'[{{"variable_id": "...", "name": "...", "description": "...", '
-                f'"type": "continuous|discrete|binary|categorical", '
-                f'"measurement_status": "measured|observable|latent"}}]'
+            evidence_text = "\n\n".join(
+                e.content[:500] for e in evidence[:15]
             )
-            retry_response = await self.llm.generate(retry_prompt, temperature=0.3)
-            retry_variables = self._parse_variables(retry_response.content)
-            # Merge: keep new ones not already in the set
-            existing_names = {v.name.lower() for v in variables}
-            for rv in retry_variables:
-                if rv.name.lower() not in existing_names:
-                    variables.append(rv)
-                    existing_names.add(rv.name.lower())
-            _logger.info("After retry: %d variables", len(variables))
 
-        _logger.info("Parsed %d variables: %s",
-                     len(variables), [v.name for v in variables])
+        # ── LangExtract: structured variable extraction ───────────────
+        prompt_desc = (
+            f"Domain: {domain}. "
+            + self.VARIABLE_EXTRACT_PROMPT
+        )
+
+        from src.config import get_settings
+        api_key = get_settings().google_ai_api_key
+
+        result = lx.extract(
+            text_or_documents=evidence_text,
+            prompt_description=prompt_desc,
+            examples=self.VARIABLE_EXTRACT_EXAMPLES,
+            model_id="gemini-2.5-flash",
+            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
+            show_progress=False,
+        )
+
+        # Map extractions → VariableCandidate
+        variables: list[VariableCandidate] = []
+        seen_names: set[str] = set()
+        for ext in (result.extractions or []):
+            if ext.extraction_class != "variable":
+                continue
+            attrs = ext.attributes or {}
+            name = ext.extraction_text.strip()
+            if not name or name.lower() in seen_names:
+                continue
+            seen_names.add(name.lower())
+
+            var_type_str = attrs.get("type", "continuous").lower()
+            meas_str = attrs.get("measurement_status", "measured").lower()
+
+            variables.append(VariableCandidate(
+                name=name,
+                description=attrs.get("description", ""),
+                var_type=(
+                    VariableType(var_type_str)
+                    if var_type_str in ["continuous", "discrete", "binary", "categorical"]
+                    else VariableType.CONTINUOUS
+                ),
+                measurement_status=(
+                    MeasurementStatus(meas_str)
+                    if meas_str in ["measured", "observable", "latent"]
+                    else MeasurementStatus.MEASURED
+                ),
+                # Provenance: match extraction_text back to evidence cache
+                evidence_sources=[
+                    h for h, eb in self._evidence_cache.items()
+                    if ext.extraction_text.lower() in eb.content.lower()
+                ],
+            ))
+
+        _logger.info(
+            "LangExtract discovered %d variables: %s",
+            len(variables), [v.name for v in variables],
+        )
 
         self._variable_candidates = variables[:max_variables]
         return self._variable_candidates
@@ -570,13 +622,14 @@ Respond with a JSON array of edges:
         max_edges: int,
     ) -> list[EdgeCandidate]:
         """
-        Draft causal DAG structure using PyWhyLLM bridge + evidence-grounded LLM.
+        Draft causal DAG structure using PyWhyLLM bridge + LangExtract.
 
         Two-stage approach:
         1. PyWhyLLM bridge proposes edges via pairwise relationship analysis
-        2. Evidence-grounded LLM prompt fills in any gaps with explicit evidence citations
+        2. LangExtract extracts grounded causal edges from evidence text,
+           with each extraction_text providing verifiable provenance
 
-        Every edge MUST reference at least one evidence bundle.
+        Every edge's extraction_text is matched back to evidence bundles.
         """
         import re as _re
 
@@ -584,16 +637,14 @@ Respond with a JSON array of edges:
             _re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')
             for v in variables
         ]
-        # Remove empty / duplicate ids
         var_ids = list(dict.fromkeys(vid for vid in var_ids if vid))
 
-        # Build evidence map keyed by variable ID
+        # Build evidence map keyed by variable ID (for PyWhyLLM)
         evidence_by_var: dict[str, list[EvidenceBundle]] = {}
         for var in variables:
             var_id = _re.sub(r'[^a-z0-9]+', '_', var.name.lower()).strip('_')
             if not var_id:
                 continue
-            # Gather all evidence mentioning this variable
             matching = [
                 eb for eb in self._evidence_cache.values()
                 if var.name.lower() in eb.content.lower()
@@ -631,147 +682,148 @@ Respond with a JSON array of edges:
                 confidence=proposal.confidence,
             ))
 
-        # ── Stage B: Evidence-grounded LLM prompt ─────────────────────
-        # Supplement with LLM-proposed edges grounded in evidence text
-        variables_text = "\n".join([
-            f"- {_re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')}: {v.description}"
+        # ── Stage B: LangExtract — grounded causal edge extraction ────
+        # Build variable context string so LangExtract knows the IDs
+        var_context = ", ".join(
+            f"{_re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')} ({v.name})"
             for v in variables
-        ])
-
-        evidence_text = "\n\n".join([
-            f"[{eb.content_hash[:8]}] (Source: {eb.source.doc_title}) {eb.content[:400]}"
-            for eb in list(self._evidence_cache.values())[:15]
-        ])
-
-        # Build a list of example pairs to guide the LLM
-        import itertools as _itertools
-        example_pairs = list(_itertools.combinations(var_ids[:8], 2))[:15]
-        pairs_text = "\n".join(
-            f"  - Does {a} cause or affect {b} (or vice versa)?"
-            for a, b in example_pairs
+        )
+        evidence_text = "\n\n".join(
+            eb.content[:500] for eb in list(self._evidence_cache.values())[:15]
+        )
+        full_text = (
+            f"Domain: {domain}. "
+            f"Variables: {var_context}.\n\n"
+            f"Evidence:\n{evidence_text}"
         )
 
-        prompt = self.EVIDENCE_GROUNDED_DAG_PROMPT.format(
-            domain=domain,
-            variables=variables_text,
-            evidence=evidence_text,
-        )
-        # Append pair suggestions to help the LLM be thorough
-        prompt += (
-            f"\n\nHere are some variable pairs to consider "
-            f"(check ALL of them for causal links):\n{pairs_text}\n\n"
-            f"Return ALL edges you find — aim for at least "
-            f"{max(3, len(var_ids) - 2)} edges for {len(var_ids)} variables."
-        )
+        # ── Dynamic prompt: constrain LangExtract to discovered vars ──
+        allowed_vars_str = ", ".join(var_ids)
+        dynamic_edge_prompt = textwrap.dedent(f"""\
+            Extract every causal relationship between variables found in
+            the evidence text.  For each relationship use exact sentences
+            or phrases from the text as extraction_text — this is the
+            proof that the relationship exists.
 
-        response = await self.llm.generate(prompt)
-        _logger.info("Evidence-grounded DAG LLM response (%d chars)", len(response.content))
+            CRITICAL CONSTRAINT: You MUST ONLY use variable IDs from
+            this list: {allowed_vars_str}
+            Do NOT invent new variable names.  The from_var and to_var
+            attributes MUST exactly match one of the IDs listed above.
 
-        llm_edges = self._parse_edges(response.content)
-        for e in llm_edges:
-            pair = (e.from_var, e.to_var)
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                edges.append(e)
+            Attributes must include from_var and to_var (using the exact
+            IDs above), the causal mechanism, and evidence strength
+            (strong / moderate / hypothesis).
+            Consider ALL possible variable pairs; a useful model has
+            many edges.""")
 
-        # Retry once if LLM returned too few edges relative to variable count.
-        # Use a focused batch prompt listing uncovered variable pairs explicitly.
-        min_expected = max(2, len(var_ids) // 2)
-        if len(edges) < min_expected and len(var_ids) >= 4:
-            _logger.info(
-                "Only %d edges for %d variables (expected >= %d), retrying with batch pairwise prompt",
-                len(edges), len(var_ids), min_expected,
-            )
-            existing_edges_text = "\n".join(
-                f"  - {e.from_var} → {e.to_var}" for e in edges
-            )
-            # Identify uncovered pairs — variables not yet connected
-            connected = set()
-            for e in edges:
-                connected.add(e.from_var)
-                connected.add(e.to_var)
-            uncovered = [v for v in var_ids if v not in connected]
-            # Build pairs between connected and uncovered variables
-            retry_pairs = []
-            for u in uncovered[:6]:
-                for c in list(connected)[:4]:
-                    retry_pairs.append((c, u))
-            if not retry_pairs:
-                # Fallback: all pairs not already covered
-                for a, b in _itertools.combinations(var_ids[:8], 2):
-                    if (a, b) not in seen_pairs and (b, a) not in seen_pairs:
-                        retry_pairs.append((a, b))
-            retry_pairs = retry_pairs[:12]
-
-            pairs_to_check = "\n".join(
-                f"  - {a} → {b}?" for a, b in retry_pairs
-            )
-            retry_prompt = (
-                f"You already found these edges:\n{existing_edges_text}\n\n"
-                f"Domain: {domain}\n\n"
-                f"Evidence:\n{evidence_text}\n\n"
-                f"Check each of these specific pairs for causal relationships "
-                f"supported by the evidence above:\n{pairs_to_check}\n\n"
-                f"For each pair where the evidence supports a causal link, "
-                f"add it to the result. Return ONLY a JSON array:\n"
-                f'[{{"from_var": "...", "to_var": "...", "mechanism": "...", '
-                f'"strength": "hypothesis|moderate|strong", "evidence_ids": [...], '
-                f'"assumptions": [...]}}]'
-            )
-            retry_response = await self.llm.generate(retry_prompt)
-            _logger.info("DAG retry response (%d chars)", len(retry_response.content))
-            retry_edges = self._parse_edges(retry_response.content)
-            for e in retry_edges:
-                pair = (e.from_var, e.to_var)
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    edges.append(e)
-            _logger.info("After batch retry: %d total edges", len(edges))
-
-        # If STILL too few edges, try individual pairwise prompts for high-priority pairs
-        if len(edges) < min_expected and len(var_ids) >= 4:
-            connected = set()
-            for e in edges:
-                connected.add(e.from_var)
-                connected.add(e.to_var)
-            uncovered = [v for v in var_ids if v not in connected]
-            pairwise_to_try = []
-            for u in uncovered[:5]:
-                for c in list(connected)[:3]:
-                    if (c, u) not in seen_pairs and (u, c) not in seen_pairs:
-                        pairwise_to_try.append((c, u))
-            # Also add some uncovered-uncovered pairs
-            for i, u1 in enumerate(uncovered[:4]):
-                for u2 in uncovered[i+1:i+3]:
-                    if (u1, u2) not in seen_pairs and (u2, u1) not in seen_pairs:
-                        pairwise_to_try.append((u1, u2))
-
-            _logger.info("Trying %d individual pairwise prompts", len(pairwise_to_try[:8]))
-            for a, b in pairwise_to_try[:8]:
-                pair_prompt = (
-                    f"Given this evidence:\n{evidence_text[:1500]}\n\n"
-                    f"Is there a causal relationship between '{a}' and '{b}'? "
-                    f"If yes, return a JSON object: "
-                    f'{{"from_var": "cause_id", "to_var": "effect_id", '
-                    f'"mechanism": "...", "strength": "hypothesis|moderate|strong"}}\n'
-                    f"If no, return: {{}}"
+        # ── Dynamic examples: use actual variable IDs, not hardcoded ──
+        dynamic_edge_examples: list[lx.data.ExampleData] = []
+        if len(var_ids) >= 2:
+            _ex_extractions = [
+                lx.data.Extraction(
+                    extraction_class="causal_edge",
+                    extraction_text=(
+                        f"Changes in {variables[0].name} influence "
+                        f"{variables[1].name}"
+                    ),
+                    attributes={
+                        "from_var": var_ids[0],
+                        "to_var": var_ids[1],
+                        "mechanism": "Direct causal influence",
+                        "strength": "moderate",
+                    },
+                ),
+            ]
+            _ex_text_parts = [
+                f"{variables[0].name} influences {variables[1].name}."
+            ]
+            if len(var_ids) >= 3:
+                _ex_extractions.append(
+                    lx.data.Extraction(
+                        extraction_class="causal_edge",
+                        extraction_text=(
+                            f"{variables[1].name} drives changes in "
+                            f"{variables[2].name}"
+                        ),
+                        attributes={
+                            "from_var": var_ids[1],
+                            "to_var": var_ids[2],
+                            "mechanism": "Indirect influence",
+                            "strength": "hypothesis",
+                        },
+                    )
                 )
-                try:
-                    pair_resp = await self.llm.generate(pair_prompt, temperature=0.2)
-                    pair_edges = self._parse_edges(pair_resp.content)
-                    for e in pair_edges:
-                        pair_key = (e.from_var, e.to_var)
-                        if pair_key not in seen_pairs and e.from_var and e.to_var:
-                            seen_pairs.add(pair_key)
-                            edges.append(e)
-                except Exception as _pair_err:
-                    _logger.warning("Pairwise prompt %s→%s failed: %s", a, b, _pair_err)
-            _logger.info("After pairwise prompts: %d total edges", len(edges))
+                _ex_text_parts.append(
+                    f"{variables[1].name} drives {variables[2].name}."
+                )
+            dynamic_edge_examples = [
+                lx.data.ExampleData(
+                    text=" ".join(_ex_text_parts),
+                    extractions=_ex_extractions,
+                )
+            ]
+        else:
+            # Fallback: use class-level examples when <2 variables
+            dynamic_edge_examples = self.EDGE_EXTRACT_EXAMPLES
 
-        _logger.info("DAG draft: %d total edges (%d from bridge, %d from LLM)",
-                     len(edges),
-                     len(bridge_result.edge_proposals),
-                     len(llm_edges))
+        from src.config import get_settings
+        api_key = get_settings().google_ai_api_key
+
+        lx_result = lx.extract(
+            text_or_documents=full_text,
+            prompt_description=dynamic_edge_prompt,
+            examples=dynamic_edge_examples,
+            model_id="gemini-2.5-flash",
+            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
+            show_progress=False,
+        )
+
+        lx_edge_count = 0
+        for ext in (lx_result.extractions or []):
+            if ext.extraction_class != "causal_edge":
+                continue
+            attrs = ext.attributes or {}
+            from_var = (attrs.get("from_var") or "").strip()
+            to_var = (attrs.get("to_var") or "").strip()
+            if not from_var or not to_var:
+                continue
+            pair = (from_var, to_var)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            strength_str = (attrs.get("strength") or "hypothesis").lower()
+            strength_map = {
+                "strong": EvidenceStrength.STRONG,
+                "moderate": EvidenceStrength.MODERATE,
+                "hypothesis": EvidenceStrength.HYPOTHESIS,
+            }
+
+            # ── Provenance: match extraction_text to evidence cache ───
+            grounded_refs: list[str] = []
+            grounded_bundle_ids: list[UUID] = []
+            quote = ext.extraction_text.lower()
+            for h, eb in self._evidence_cache.items():
+                if quote in eb.content.lower():
+                    grounded_refs.append(h)
+                    grounded_bundle_ids.append(eb.bundle_id)
+
+            edges.append(EdgeCandidate(
+                from_var=from_var,
+                to_var=to_var,
+                mechanism=attrs.get("mechanism", ""),
+                strength=strength_map.get(strength_str, EvidenceStrength.HYPOTHESIS),
+                evidence_refs=grounded_refs,
+                evidence_bundle_ids=grounded_bundle_ids,
+                assumptions=[],
+                confidence=0.7 if grounded_refs else 0.4,
+            ))
+            lx_edge_count += 1
+
+        _logger.info(
+            "DAG draft: %d total edges (%d from bridge, %d from LangExtract)",
+            len(edges), len(bridge_result.edge_proposals), lx_edge_count,
+        )
 
         # Apply variable role classifications from bridge
         for vc in bridge_result.variable_classifications:
@@ -851,144 +903,10 @@ Respond with a JSON array of edges:
                 strength.value, confidence,
             )
     
-    @staticmethod
-    def _extract_json_array(content: str) -> list[dict]:
-        """Robustly extract a JSON array from LLM content."""
-        import json
-        import re
-
-        # Strategy 1: greedy match inside a fenced code block
-        m = re.search(r'```(?:json)?\s*(\[.*\])\s*```', content, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
-
-        # Strategy 2: find the outermost [ ... ] in the entire text
-        start = content.find('[')
-        end = content.rfind(']')
-        if start != -1 and end > start:
-            try:
-                return json.loads(content[start:end + 1])
-            except json.JSONDecodeError:
-                pass
-
-        # Strategy 3: LLM sometimes omits the outer [ ].
-        # Wrap a fenced code block in [ ] and try again.
-        m2 = re.search(r'```(?:json)?\s*(.*?)\s*```', content, re.DOTALL)
-        body = m2.group(1).strip() if m2 else content.strip()
-        if body and not body.startswith('['):
-            try:
-                return json.loads(f'[{body}]')
-            except json.JSONDecodeError:
-                pass
-
-        # Strategy 4: find all top-level { ... } objects via bracket matching
-        objects: list[dict] = []
-        depth = 0
-        obj_start = -1
-        for i, ch in enumerate(content):
-            if ch == '{':
-                if depth == 0:
-                    obj_start = i
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0 and obj_start != -1:
-                    try:
-                        obj = json.loads(content[obj_start:i + 1])
-                        if isinstance(obj, dict):
-                            objects.append(obj)
-                    except json.JSONDecodeError:
-                        pass
-                    obj_start = -1
-        if objects:
-            return objects
-
-        # Strategy 5: repair truncated JSON arrays — close open strings,
-        # objects, and arrays so we can salvage complete items.
-        if start != -1:
-            fragment = content[start:]
-            # Try closing progressively
-            for repair in ['"}]', '"}]', '"}}]', '"]']:
-                try:
-                    parsed = json.loads(fragment + repair)
-                    if isinstance(parsed, list):
-                        # Only keep items that have at least from_var or source
-                        return [
-                            item for item in parsed
-                            if isinstance(item, dict)
-                            and (item.get("from_var") or item.get("source"))
-                        ]
-                except json.JSONDecodeError:
-                    continue
-
-        return []
-
-    def _parse_variables(self, content: str) -> list[VariableCandidate]:
-        """Parse variables from LLM response."""
-        data = self._extract_json_array(content)
-        if not data:
-            return []
-
-        variables = []
-        for item in data:
-            var_type = item.get("type", "continuous").lower()
-            measurement = item.get("measurement_status", "measured").lower()
-
-            variables.append(VariableCandidate(
-                name=item.get("name", item.get("variable_id", "unknown")),
-                description=item.get("description", ""),
-                var_type=VariableType(var_type) if var_type in ["continuous", "discrete", "binary", "categorical"] else VariableType.CONTINUOUS,
-                measurement_status=MeasurementStatus(measurement) if measurement in ["measured", "observable", "latent"] else MeasurementStatus.MEASURED,
-            ))
-        return variables
-    
-    def _parse_edges(self, content: str) -> list[EdgeCandidate]:
-        """Parse edges from LLM response, including evidence IDs and assumptions."""
-        data = self._extract_json_array(content)
-        if not data:
-            return []
-
-        edges = []
-        for item in data:
-            # Accept both from_var/to_var and source/target naming conventions
-            from_var = (
-                item.get("from_var")
-                or item.get("source")
-                or item.get("cause")
-                or ""
-            ).strip()
-            to_var = (
-                item.get("to_var")
-                or item.get("target")
-                or item.get("effect")
-                or ""
-            ).strip()
-            # Skip edges with empty or missing variable IDs
-            if not from_var or not to_var:
-                continue
-            strength_str = item.get("strength", "hypothesis").lower()
-            strength_map = {
-                "strong": EvidenceStrength.STRONG,
-                "moderate": EvidenceStrength.MODERATE,
-                "hypothesis": EvidenceStrength.HYPOTHESIS,
-            }
-
-            # Parse evidence IDs if provided by evidence-grounded prompt
-            evidence_ids = item.get("evidence_ids", [])
-            assumptions = item.get("assumptions", [])
-
-            edges.append(EdgeCandidate(
-                from_var=from_var,
-                to_var=to_var,
-                mechanism=item.get("mechanism", ""),
-                strength=strength_map.get(strength_str, EvidenceStrength.HYPOTHESIS),
-                evidence_refs=evidence_ids if isinstance(evidence_ids, list) else [],
-                assumptions=assumptions if isinstance(assumptions, list) else [],
-            ))
-        return edges
+    # ── Legacy regex extractors removed ─────────────────────────────────
+    # _extract_json_array, _parse_variables, _parse_edges have been
+    # replaced by LangExtract structured extraction (see _discover_variables
+    # and _draft_dag).  No regex-based JSON parsing remains.
     
     def _create_audit(
         self,

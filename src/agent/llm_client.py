@@ -347,7 +347,7 @@ Respond ONLY with the JSON, no other text."""
         def _convert(node: dict[str, Any]) -> dict[str, Any]:
             result: dict[str, Any] = {}
             json_type = node.get("type", "string")
-            result["type_"] = TYPE_MAP.get(json_type, "STRING")
+            result["type"] = TYPE_MAP.get(json_type, "STRING")
 
             if "description" in node:
                 result["description"] = node["description"]

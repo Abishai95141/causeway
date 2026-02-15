@@ -46,6 +46,9 @@ dependencies = [
     # LLM
     "google-genai>=1.0.0",
     
+    # Structured Extraction
+    "langextract>=1.1.0",
+    
     # Document Processing
     "pypdf>=3.17.0",
     "openpyxl>=3.1.0",
