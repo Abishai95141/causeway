@@ -235,6 +235,19 @@ class WorldModelDetail(BaseModel):
     edges: list[EdgeDetail]
 
 
+# ===== Phase 6 Response Models (declared early for route ordering) =====
+
+class BridgeSummary(BaseModel):
+    """Summary of a bridge for listing."""
+    bridge_id: str
+    source_version_id: str
+    target_version_id: str
+    edge_count: int
+    concept_count: int
+    status: str
+    created_at: Optional[str] = None
+
+
 # ===== Search Endpoint =====
 
 class SearchRequest(BaseModel):
@@ -702,6 +715,61 @@ async def list_world_models():
     return summaries
 
 
+@router.get("/world-models/bridges", response_model=list[BridgeSummary])
+async def list_bridges():
+    """List all cross-model bridges."""
+    from src.storage.database import get_db_session, DatabaseService
+
+    try:
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            bridges = await db.list_all_bridges()
+            return [
+                BridgeSummary(
+                    bridge_id=str(b.bridge_id),
+                    source_version_id=b.source_version_id,
+                    target_version_id=b.target_version_id,
+                    edge_count=len(b.bridge_edges or []),
+                    concept_count=len(b.shared_concepts or []),
+                    status=b.status,
+                    created_at=b.created_at.isoformat() if b.created_at else None,
+                )
+                for b in bridges
+            ]
+    except Exception as exc:
+        logger.error("list_bridges failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/world-models/bridges/{bridge_id}")
+async def get_bridge(bridge_id: str):
+    """Get details of a specific bridge."""
+    from src.storage.database import get_db_session, DatabaseService
+    from uuid import UUID as _UUID
+
+    try:
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            bridge = await db.get_model_bridge(_UUID(bridge_id))
+            if not bridge:
+                raise HTTPException(status_code=404, detail=f"Bridge {bridge_id} not found")
+            return {
+                "bridge_id": str(bridge.bridge_id),
+                "source_version_id": bridge.source_version_id,
+                "target_version_id": bridge.target_version_id,
+                "bridge_edges": bridge.bridge_edges,
+                "shared_concepts": bridge.shared_concepts,
+                "status": bridge.status,
+                "created_at": bridge.created_at.isoformat() if bridge.created_at else None,
+                "description": bridge.description,
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("get_bridge failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.get("/world-models/{domain}", response_model=WorldModelSummary)
 async def get_world_model(domain: str):
     """Get a specific world model by domain (in-memory or DB)."""
@@ -1022,4 +1090,212 @@ async def purge_all_documents(request: PurgeRequest):
         files_deleted=files_deleted,
         errors=errors,
         warnings=warnings,
+    )
+
+
+# =====================================================================
+# World Model Update (PATCH) — Phase 6
+# =====================================================================
+
+class PatchWorldModelRequest(BaseModel):
+    """Request body for PATCH /world-models/{domain}."""
+    add_variables: list[dict[str, Any]] = Field(default_factory=list)
+    remove_variables: list[str] = Field(default_factory=list)
+    add_edges: list[dict[str, Any]] = Field(default_factory=list)
+    remove_edges: list[dict[str, str]] = Field(default_factory=list)
+    update_edges: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PatchWorldModelResponse(BaseModel):
+    """Response body for PATCH /world-models/{domain}."""
+    old_version_id: str
+    new_version_id: str
+    variables_added: int = 0
+    variables_removed: int = 0
+    edges_added: int = 0
+    edges_removed: int = 0
+    edges_updated: int = 0
+    conflicts: list[str] = Field(default_factory=list)
+
+
+@router.patch("/world-models/{domain}", response_model=PatchWorldModelResponse)
+async def patch_world_model(domain: str, request: PatchWorldModelRequest):
+    """
+    Apply an incremental patch to an existing world model.
+
+    Supports adding/removing variables, adding/removing edges,
+    and updating edge metadata.  Edges that would create cycles
+    are automatically skipped and reported in ``conflicts``.
+    """
+    from src.models.causal import (
+        WorldModelPatch, VariableDefinition, CausalEdge, EdgeMetadata, EdgeUpdate,
+    )
+    from src.models.enums import (
+        EvidenceStrength, MeasurementStatus, VariableType, VariableRole,
+    )
+
+    causal = get_causal_service()
+
+    # Build VariableDefinition objects
+    add_vars = []
+    for v in request.add_variables:
+        add_vars.append(VariableDefinition(
+            variable_id=v["variable_id"],
+            name=v.get("name", v["variable_id"]),
+            definition=v.get("definition", ""),
+            type=VariableType(v["type"].lower()) if v.get("type") else VariableType.CONTINUOUS,
+            measurement_status=MeasurementStatus(v["measurement_status"].lower()) if v.get("measurement_status") else MeasurementStatus.LATENT,
+            role=VariableRole(v["role"].lower()) if v.get("role") else VariableRole.UNKNOWN,
+        ))
+
+    # Build CausalEdge objects
+    add_edges = []
+    for e in request.add_edges:
+        add_edges.append(CausalEdge(
+            from_var=e["from_var"],
+            to_var=e["to_var"],
+            metadata=EdgeMetadata(
+                mechanism=e.get("mechanism", ""),
+                evidence_strength=EvidenceStrength(e["strength"].lower()) if e.get("strength") else EvidenceStrength.HYPOTHESIS,
+                confidence=e.get("confidence", 0.5),
+            ),
+        ))
+
+    # Build EdgeUpdate objects
+    update_edges = []
+    for eu in request.update_edges:
+        update_edges.append(EdgeUpdate(
+            from_var=eu["from_var"],
+            to_var=eu["to_var"],
+            mechanism=eu.get("mechanism"),
+            evidence_strength=EvidenceStrength(eu["evidence_strength"].lower()) if eu.get("evidence_strength") else None,
+            confidence=eu.get("confidence"),
+        ))
+
+    patch = WorldModelPatch(
+        add_variables=add_vars,
+        remove_variables=request.remove_variables,
+        add_edges=add_edges,
+        remove_edges=request.remove_edges,
+        update_edges=update_edges,
+    )
+
+    try:
+        result = await causal.update_world_model(domain, patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error("patch_world_model failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return PatchWorldModelResponse(
+        old_version_id=result.old_version_id,
+        new_version_id=result.new_version_id,
+        variables_added=result.variables_added,
+        variables_removed=result.variables_removed,
+        edges_added=result.edges_added,
+        edges_removed=result.edges_removed,
+        edges_updated=result.edges_updated,
+        conflicts=result.conflicts,
+    )
+
+
+# =====================================================================
+# Cross-Model Bridges — Phase 6
+# =====================================================================
+
+class BuildBridgeRequest(BaseModel):
+    """Request body for POST /world-models/bridge."""
+    source_domain: str
+    target_domain: str
+    use_llm: bool = Field(default=True, description="Use LLM for concept mapping (else heuristic)")
+
+
+class BridgeEdgeResponse(BaseModel):
+    """A single bridge edge in a response."""
+    source_domain: str
+    source_var: str
+    target_domain: str
+    target_var: str
+    mechanism: str = ""
+    strength: str = "HYPOTHESIS"
+    confidence: float = 0.5
+
+
+class ConceptMappingResponse(BaseModel):
+    """A concept mapping in a response."""
+    source_var: str
+    target_var: str
+    similarity_score: float
+    mapping_rationale: str = ""
+
+
+class BuildBridgeResponse(BaseModel):
+    """Response from bridge building."""
+    bridge_id: str
+    source_domain: str
+    target_domain: str
+    bridge_edges: list[BridgeEdgeResponse]
+    shared_concepts: list[ConceptMappingResponse]
+    status: str
+
+
+@router.post("/world-models/bridge", response_model=BuildBridgeResponse)
+async def build_bridge(request: BuildBridgeRequest):
+    """
+    Build a cross-model bridge between two domain world models.
+
+    Discovers shared concepts, proposes directed bridge edges,
+    and validates acyclicity across the federated graph.
+    """
+    causal = get_causal_service()
+
+    llm_client = None
+    if request.use_llm:
+        try:
+            from src.agent.llm_client import LLMClient
+            llm_client = LLMClient()
+            await llm_client.initialize()
+        except Exception as exc:
+            logger.warning("LLM init failed for bridge, using heuristic: %s", exc)
+            llm_client = None
+
+    try:
+        bridge = await causal.build_bridge(
+            source_domain=request.source_domain,
+            target_domain=request.target_domain,
+            llm_client=llm_client,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error("build_bridge failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return BuildBridgeResponse(
+        bridge_id=bridge.bridge_id,
+        source_domain=bridge.source_domain,
+        target_domain=bridge.target_domain,
+        bridge_edges=[
+            BridgeEdgeResponse(
+                source_domain=e.source_domain,
+                source_var=e.source_var,
+                target_domain=e.target_domain,
+                target_var=e.target_var,
+                mechanism=e.mechanism,
+                strength=e.strength.value if hasattr(e.strength, "value") else str(e.strength),
+                confidence=e.confidence,
+            )
+            for e in bridge.bridge_edges
+        ],
+        shared_concepts=[
+            ConceptMappingResponse(
+                source_var=c.source_var,
+                target_var=c.target_var,
+                similarity_score=c.similarity_score,
+                mapping_rationale=c.mapping_rationale,
+            )
+            for c in bridge.shared_concepts
+        ],
+        status=bridge.status.value if hasattr(bridge.status, "value") else str(bridge.status),
     )

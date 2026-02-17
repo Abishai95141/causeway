@@ -197,3 +197,77 @@ class WorldModelVersion(BaseModel):
             }
         }
     }
+
+
+# ---------------------------------------------------------------------------
+# World Model Patch (incremental update)
+# ---------------------------------------------------------------------------
+
+class EdgeUpdate(BaseModel):
+    """Partial update for an existing edge's metadata."""
+    from_var: str
+    to_var: str
+    mechanism: Optional[str] = None
+    evidence_strength: Optional[EvidenceStrength] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class WorldModelPatch(BaseModel):
+    """Incremental patch to apply to an existing world model."""
+    add_variables: list[VariableDefinition] = Field(default_factory=list)
+    remove_variables: list[str] = Field(default_factory=list, description="variable_ids to remove")
+    add_edges: list[CausalEdge] = Field(default_factory=list)
+    remove_edges: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="List of {from_var, to_var} dicts",
+    )
+    update_edges: list[EdgeUpdate] = Field(default_factory=list)
+
+
+class WorldModelUpdateResult(BaseModel):
+    """Result of applying a patch to a world model."""
+    old_version_id: str
+    new_version_id: str
+    variables_added: int = 0
+    variables_removed: int = 0
+    edges_added: int = 0
+    edges_removed: int = 0
+    edges_updated: int = 0
+    conflicts: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Cross-Model Bridge models
+# ---------------------------------------------------------------------------
+
+class ConceptMapping(BaseModel):
+    """A mapping between semantically equivalent variables across models."""
+    source_var: str
+    target_var: str
+    similarity_score: float = Field(ge=0.0, le=1.0)
+    mapping_rationale: str = ""
+
+
+class BridgeEdge(BaseModel):
+    """A directed causal edge spanning two different domain models."""
+    source_domain: str
+    source_var: str
+    target_domain: str
+    target_var: str
+    mechanism: str = ""
+    strength: EvidenceStrength = EvidenceStrength.HYPOTHESIS
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    mapping_rationale: str = ""
+
+
+class ModelBridge(BaseModel):
+    """A bridge linking two world models via shared/causal concepts."""
+    bridge_id: str
+    source_version_id: str
+    source_domain: str
+    target_version_id: str
+    target_domain: str
+    bridge_edges: list[BridgeEdge] = Field(default_factory=list)
+    shared_concepts: list[ConceptMapping] = Field(default_factory=list)
+    status: ModelStatus = ModelStatus.DRAFT
+    created_at: Optional[datetime] = None

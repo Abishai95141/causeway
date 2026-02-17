@@ -129,6 +129,7 @@ class WorldModelVersionDB(Base):
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft", index=True)
     replaces_version: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     
     # Relationship to evidence links
     evidence_links: Mapped[list["WMEvidenceLinkDB"]] = relationship(
@@ -171,6 +172,41 @@ class WMEvidenceLinkDB(Base):
         UniqueConstraint("version_id", "bundle_id", name="uq_wm_evidence"),
         Index("idx_wmel_version", "version_id"),
         Index("idx_wmel_bundle", "bundle_id"),
+    )
+
+
+class ModelBridgeDB(Base):
+    """Cross-model bridge linking two world models."""
+
+    __tablename__ = "model_bridges"
+
+    bridge_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    source_version_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("world_model_versions.version_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_version_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("world_model_versions.version_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    bridge_edges: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    shared_concepts: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False, default="system")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    metadata_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    __table_args__ = (
+        UniqueConstraint("source_version_id", "target_version_id", name="uq_bridge_pair"),
+        Index("idx_bridge_source", "source_version_id"),
+        Index("idx_bridge_target", "target_version_id"),
     )
 
 
@@ -399,6 +435,52 @@ class DatabaseService:
         await self.session.flush()
         return link
     
+    # ----- Model Bridges -----
+
+    async def create_model_bridge(self, **kwargs) -> ModelBridgeDB:
+        """Create a new cross-model bridge."""
+        bridge = ModelBridgeDB(**kwargs)
+        self.session.add(bridge)
+        await self.session.flush()
+        return bridge
+
+    async def get_model_bridge(self, bridge_id: UUID) -> Optional[ModelBridgeDB]:
+        """Get bridge by ID."""
+        return await self.session.get(ModelBridgeDB, bridge_id)
+
+    async def get_bridges_for_model(self, version_id: str) -> list[ModelBridgeDB]:
+        """Get all bridges involving a world model (as source or target)."""
+        from sqlalchemy import select, or_
+        result = await self.session.execute(
+            select(ModelBridgeDB).where(
+                or_(
+                    ModelBridgeDB.source_version_id == version_id,
+                    ModelBridgeDB.target_version_id == version_id,
+                )
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_all_bridges(self) -> list[ModelBridgeDB]:
+        """List all cross-model bridges."""
+        from sqlalchemy import select
+        result = await self.session.execute(
+            select(ModelBridgeDB).order_by(ModelBridgeDB.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def update_model_bridge(
+        self, bridge_id: UUID, **kwargs
+    ) -> Optional[ModelBridgeDB]:
+        """Update bridge fields."""
+        bridge = await self.get_model_bridge(bridge_id)
+        if bridge:
+            for k, v in kwargs.items():
+                if hasattr(bridge, k):
+                    setattr(bridge, k, v)
+            await self.session.flush()
+        return bridge
+
     # ----- Audit Log -----
     
     async def create_audit_entry(self, **kwargs) -> AuditLogDB:

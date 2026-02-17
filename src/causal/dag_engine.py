@@ -398,3 +398,121 @@ class DAGEngine:
         self._graph.clear()
         self._variables.clear()
         self._edges.clear()
+
+    # ------------------------------------------------------------------ #
+    # Incremental merge (Phase: World Model Update)
+    # ------------------------------------------------------------------ #
+
+    def merge_patch(self, patch, conflict_strategy: str = "reject_cycles") -> dict[str, Any]:
+        """Apply an incremental patch to the DAG.
+
+        Processing order:
+        1. remove_edges  (safe, reduces graph)
+        2. remove_variables (cascade-removes connected edges)
+        3. add_variables
+        4. add_edges (acyclicity enforced)
+        5. update_edges (metadata-only)
+
+        Args:
+            patch: A ``WorldModelPatch`` instance.
+            conflict_strategy: Currently only ``"reject_cycles"`` — edges
+                that would create cycles are skipped with a warning.
+
+        Returns:
+            Summary dict with counts and any skipped/conflicting items.
+        """
+        from src.models.causal import WorldModelPatch  # avoid circular at module level
+
+        if not isinstance(patch, WorldModelPatch):
+            raise TypeError(f"Expected WorldModelPatch, got {type(patch).__name__}")
+
+        conflicts: list[str] = []
+        vars_added = vars_removed = edges_added = edges_removed = edges_updated = 0
+
+        # 1. Remove edges
+        for edge_spec in patch.remove_edges:
+            fv, tv = edge_spec.get("from_var", ""), edge_spec.get("to_var", "")
+            try:
+                self.remove_edge(fv, tv)
+                edges_removed += 1
+            except (ValueError, KeyError) as exc:
+                conflicts.append(f"remove_edge {fv}→{tv}: {exc}")
+
+        # 2. Remove variables
+        for var_id in patch.remove_variables:
+            try:
+                self.remove_variable(var_id)
+                vars_removed += 1
+            except Exception as exc:
+                conflicts.append(f"remove_variable {var_id}: {exc}")
+
+        # 3. Add variables
+        for var_def in patch.add_variables:
+            if var_def.variable_id in self._variables:
+                conflicts.append(f"add_variable {var_def.variable_id}: already exists (skipped)")
+                continue
+            self._variables[var_def.variable_id] = var_def
+            self._graph.add_node(var_def.variable_id, **var_def.model_dump())
+            vars_added += 1
+
+        # 4. Add edges
+        for edge in patch.add_edges:
+            try:
+                self.add_edge(
+                    from_var=edge.from_var,
+                    to_var=edge.to_var,
+                    mechanism=edge.metadata.mechanism,
+                    strength=edge.metadata.evidence_strength,
+                    evidence_refs=edge.metadata.evidence_refs,
+                    confidence=edge.metadata.confidence,
+                    assumptions=edge.metadata.assumptions,
+                    conditions=edge.metadata.conditions,
+                    contradicting_refs=edge.metadata.contradicting_refs,
+                )
+                edges_added += 1
+            except CycleDetectedError:
+                conflicts.append(f"add_edge {edge.from_var}→{edge.to_var}: would create cycle (skipped)")
+            except Exception as exc:
+                conflicts.append(f"add_edge {edge.from_var}→{edge.to_var}: {exc}")
+
+        # 5. Update edges
+        for eu in patch.update_edges:
+            edge_key = (eu.from_var, eu.to_var)
+            if edge_key not in self._edges:
+                conflicts.append(f"update_edge {eu.from_var}→{eu.to_var}: not found")
+                continue
+            edge = self._edges[edge_key]
+            if eu.mechanism is not None:
+                edge.metadata.mechanism = eu.mechanism
+                self._graph[eu.from_var][eu.to_var]["mechanism"] = eu.mechanism
+            if eu.evidence_strength is not None:
+                edge.metadata.evidence_strength = eu.evidence_strength
+                self._graph[eu.from_var][eu.to_var]["strength"] = eu.evidence_strength.value
+            if eu.confidence is not None:
+                edge.metadata.confidence = eu.confidence
+            edges_updated += 1
+
+        return {
+            "variables_added": vars_added,
+            "variables_removed": vars_removed,
+            "edges_added": edges_added,
+            "edges_removed": edges_removed,
+            "edges_updated": edges_updated,
+            "conflicts": conflicts,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Boundary variables (for cross-model bridging)
+    # ------------------------------------------------------------------ #
+
+    def extract_boundary_variables(self) -> dict[str, VariableDefinition]:
+        """Return variables that are roots (in-degree 0) or leaves (out-degree 0).
+
+        These are the natural interface points for cross-model bridging
+        because they represent external inputs or terminal outputs.
+        """
+        boundary: dict[str, VariableDefinition] = {}
+        for var_id, var_def in self._variables.items():
+            if self._graph.in_degree(var_id) == 0 or self._graph.out_degree(var_id) == 0:
+                boundary[var_id] = var_def
+        return boundary

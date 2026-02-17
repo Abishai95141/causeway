@@ -326,3 +326,130 @@ if st.session_state.get("world_models"):
 
 st.markdown("---")
 st.caption("✅ After building a world model, proceed to **Decision Support** →")
+
+# =====================================================================
+# Update Existing Model — Incremental Patch
+# =====================================================================
+st.markdown("---")
+st.header("🔧 Update Existing Model")
+st.markdown(
+    "Apply incremental changes to an existing world model: "
+    "add or remove variables and edges, or tweak edge metadata."
+)
+
+update_domain = st.text_input(
+    "Domain to update",
+    placeholder="e.g. pricing",
+    key="update_domain",
+)
+
+if update_domain:
+    with st.expander("➕ Add Variables", expanded=False):
+        add_var_id = st.text_input("Variable ID (snake_case)", key="av_id")
+        add_var_name = st.text_input("Name", key="av_name")
+        add_var_def = st.text_input("Definition", key="av_def")
+        add_var_type = st.selectbox(
+            "Type", ["CONTINUOUS", "BINARY", "CATEGORICAL", "ORDINAL", "COUNT"],
+            key="av_type",
+        )
+        if st.button("Stage Variable", key="av_btn"):
+            if add_var_id:
+                staged = st.session_state.setdefault("_patch_add_vars", [])
+                staged.append({
+                    "variable_id": add_var_id,
+                    "name": add_var_name or add_var_id,
+                    "definition": add_var_def or "",
+                    "type": add_var_type,
+                })
+                st.success(f"Staged variable **{add_var_id}**")
+
+    with st.expander("➖ Remove Variables", expanded=False):
+        rm_var = st.text_input("Variable ID to remove", key="rm_var")
+        if st.button("Stage Removal", key="rm_btn"):
+            if rm_var:
+                staged = st.session_state.setdefault("_patch_rm_vars", [])
+                staged.append(rm_var)
+                st.success(f"Staged removal of **{rm_var}**")
+
+    with st.expander("🔗 Add Edges", expanded=False):
+        ae_from = st.text_input("From variable", key="ae_from")
+        ae_to = st.text_input("To variable", key="ae_to")
+        ae_mech = st.text_input("Mechanism", key="ae_mech")
+        ae_str = st.selectbox(
+            "Strength",
+            ["HYPOTHESIS", "MODERATE", "STRONG", "CONTESTED"],
+            key="ae_str",
+        )
+        if st.button("Stage Edge", key="ae_btn"):
+            if ae_from and ae_to:
+                staged = st.session_state.setdefault("_patch_add_edges", [])
+                staged.append({
+                    "from_var": ae_from,
+                    "to_var": ae_to,
+                    "mechanism": ae_mech or "",
+                    "strength": ae_str,
+                })
+                st.success(f"Staged edge **{ae_from} → {ae_to}**")
+
+    with st.expander("✂️ Remove Edges", expanded=False):
+        re_from = st.text_input("From variable", key="re_from")
+        re_to = st.text_input("To variable", key="re_to")
+        if st.button("Stage Edge Removal", key="re_btn"):
+            if re_from and re_to:
+                staged = st.session_state.setdefault("_patch_rm_edges", [])
+                staged.append({"from_var": re_from, "to_var": re_to})
+                st.success(f"Staged removal of **{re_from} → {re_to}**")
+
+    # Show staged changes
+    staged_vars = st.session_state.get("_patch_add_vars", [])
+    staged_rm = st.session_state.get("_patch_rm_vars", [])
+    staged_edges = st.session_state.get("_patch_add_edges", [])
+    staged_rm_edges = st.session_state.get("_patch_rm_edges", [])
+
+    if any([staged_vars, staged_rm, staged_edges, staged_rm_edges]):
+        st.markdown("#### Staged Changes")
+        if staged_vars:
+            st.write(f"**Add variables:** {[v['variable_id'] for v in staged_vars]}")
+        if staged_rm:
+            st.write(f"**Remove variables:** {staged_rm}")
+        if staged_edges:
+            edge_labels = [e['from_var'] + '→' + e['to_var'] for e in staged_edges]
+            st.write(f"**Add edges:** {edge_labels}")
+        if staged_rm_edges:
+            rm_edge_labels = [e['from_var'] + '→' + e['to_var'] for e in staged_rm_edges]
+            st.write(f"**Remove edges:** {rm_edge_labels}")
+
+        if st.button("🚀 Apply Patch", key="apply_patch", type="primary"):
+            payload = {
+                "add_variables": staged_vars,
+                "remove_variables": staged_rm,
+                "add_edges": staged_edges,
+                "remove_edges": staged_rm_edges,
+                "update_edges": [],
+            }
+            with st.spinner("Applying patch…"):
+                try:
+                    resp = requests.patch(
+                        f"{API}/world-models/{update_domain}",
+                        json=payload,
+                        timeout=30,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        st.success(
+                            f"✅ Patch applied!  "
+                            f"+{data.get('variables_added',0)} vars, "
+                            f"-{data.get('variables_removed',0)} vars, "
+                            f"+{data.get('edges_added',0)} edges, "
+                            f"-{data.get('edges_removed',0)} edges"
+                        )
+                        if data.get("conflicts"):
+                            st.warning("Conflicts:\n" + "\n".join(data["conflicts"]))
+                        st.json(data)
+                        # Clear staged
+                        for k in ["_patch_add_vars", "_patch_rm_vars", "_patch_add_edges", "_patch_rm_edges"]:
+                            st.session_state.pop(k, None)
+                    else:
+                        st.error(f"❌ Patch failed ({resp.status_code}): {resp.text[:300]}")
+                except Exception as exc:
+                    st.error(f"❌ Error applying patch: {exc}")

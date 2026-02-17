@@ -25,7 +25,10 @@ from src.causal.conflict_resolver import (
 )
 from src.causal.temporal import TemporalTracker, StalenessReport, EdgeTemporalMetadata
 from src.training.feedback import FeedbackCollector, OutcomeFeedback, FeedbackSummary
-from src.models.causal import WorldModelVersion, VariableDefinition, CausalEdge, EdgeMetadata
+from src.models.causal import (
+    WorldModelVersion, VariableDefinition, CausalEdge, EdgeMetadata,
+    WorldModelPatch, WorldModelUpdateResult, ModelBridge, BridgeEdge, ConceptMapping,
+)
 from src.models.evidence import EvidenceBundle
 from src.models.enums import EvidenceStrength, ModelStatus, VariableRole, VariableType, MeasurementStatus
 
@@ -479,6 +482,112 @@ class CausalService:
         return self._feedback_collector.compute_training_reward(decision_trace_id)
 
     # ------------------------------------------------------------------ #
+    # World Model Update (incremental patch)
+    # ------------------------------------------------------------------ #
+
+    async def update_world_model(
+        self,
+        domain: str,
+        patch: WorldModelPatch,
+    ) -> WorldModelUpdateResult:
+        """
+        Apply an incremental patch to an existing world model and persist.
+
+        1. Get the current engine (load from DB if needed).
+        2. Snapshot the old version_id.
+        3. Apply ``merge_patch`` to the in-memory DAG.
+        4. Save new version to DB with ``replaces_version`` set.
+        5. Return the update result.
+        """
+        engine = self._engines.get(domain)
+        if engine is None:
+            try:
+                engine = await self.load_from_db(domain)
+            except ValueError:
+                raise ValueError(f"No world model found for domain '{domain}'")
+
+        old_model = engine.to_world_model(domain, f"World model for {domain}")
+        old_version_id = old_model.version_id
+
+        result = engine.merge_patch(patch)
+
+        # Persist the updated model
+        new_version_id = await self.save_to_db(domain=domain)
+
+        return WorldModelUpdateResult(
+            old_version_id=old_version_id,
+            new_version_id=new_version_id,
+            variables_added=result["variables_added"],
+            variables_removed=result["variables_removed"],
+            edges_added=result["edges_added"],
+            edges_removed=result["edges_removed"],
+            edges_updated=result["edges_updated"],
+            conflicts=result["conflicts"],
+        )
+
+    # ------------------------------------------------------------------ #
+    # Cross-Model Bridging
+    # ------------------------------------------------------------------ #
+
+    async def build_bridge(
+        self,
+        source_domain: str,
+        target_domain: str,
+        llm_client: Any = None,
+    ) -> ModelBridge:
+        """
+        Build a cross-model bridge between two domains.
+
+        Delegates to ``BridgeEngine.build_bridge``.
+        Persists the result to PostgreSQL.
+        """
+        from src.causal.bridge_engine import BridgeEngine
+
+        source_engine = self._engines.get(source_domain)
+        if source_engine is None:
+            try:
+                source_engine = await self.load_from_db(source_domain)
+            except ValueError:
+                raise ValueError(f"No world model for source domain '{source_domain}'")
+
+        target_engine = self._engines.get(target_domain)
+        if target_engine is None:
+            try:
+                target_engine = await self.load_from_db(target_domain)
+            except ValueError:
+                raise ValueError(f"No world model for target domain '{target_domain}'")
+
+        source_model = source_engine.to_world_model(source_domain, f"World model for {source_domain}")
+        target_model = target_engine.to_world_model(target_domain, f"World model for {target_domain}")
+
+        bridge_eng = BridgeEngine()
+        bridge = await bridge_eng.build_bridge(
+            source_model, source_engine,
+            target_model, target_engine,
+            llm_client,
+        )
+
+        # Persist bridge to DB
+        from src.storage.database import get_db_session, DatabaseService
+        async with get_db_session() as session:
+            db = DatabaseService(session)
+            await db.create_model_bridge(
+                source_version_id=bridge.source_version_id,
+                target_version_id=bridge.target_version_id,
+                bridge_edges=[e.model_dump(mode="json") for e in bridge.bridge_edges],
+                shared_concepts=[c.model_dump(mode="json") for c in bridge.shared_concepts],
+                status=bridge.status.value if bridge.status else "draft",
+                description=f"Bridge: {source_domain} ↔ {target_domain}",
+            )
+
+        logger.info(
+            "Bridge built: %s ↔ %s — %d edges, %d shared concepts",
+            source_domain, target_domain,
+            len(bridge.bridge_edges), len(bridge.shared_concepts),
+        )
+        return bridge
+
+    # ------------------------------------------------------------------ #
     # PostgreSQL persistence
     # ------------------------------------------------------------------ #
 
@@ -527,10 +636,15 @@ class CausalService:
         async with get_db_session() as session:
             db = DatabaseService(session)
             existing = await db.get_world_model(model.version_id)
+            engine = self.get_engine(target_domain)
+            full_dag_json = engine.to_json()
+
             if existing:
                 existing.variables = variables_json
                 existing.edges = edges_json
-                existing.dag_json = {"domain": target_domain}
+                existing.dag_json = full_dag_json
+                from datetime import datetime as _dt, timezone as _tz
+                existing.updated_at = _dt.now(_tz.utc)
                 await session.flush()
                 saved_id = existing.version_id
             else:
@@ -540,8 +654,9 @@ class CausalService:
                     description=f"World model for {target_domain}",
                     variables=variables_json,
                     edges=edges_json,
-                    dag_json={"domain": target_domain},
+                    dag_json=full_dag_json,
                     status=model.status.value if model.status else "draft",
+                    replaces_version=model.replaces_version or None,
                 )
                 saved_id = wm.version_id
 
