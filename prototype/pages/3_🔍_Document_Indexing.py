@@ -392,6 +392,64 @@ with col2:
 
 st.markdown("---")
 
+# ── Danger Zone: Purge All Document Data ───────────────────────
+st.markdown("### 🗑️ Danger Zone")
+st.markdown(
+    "Permanently **delete all documents** from the vector store, "
+    "object storage, and database. This action cannot be undone."
+)
+
+purge_confirmed = st.checkbox(
+    "I understand this will permanently delete all documents",
+    key="purge_confirm",
+)
+
+purge_clicked = st.button(
+    "🗑️ Purge All Document Data",
+    key="purge_btn",
+    disabled=not purge_confirmed,
+    type="primary",
+)
+
+if purge_clicked and purge_confirmed:
+    with st.spinner("Purging all document data…"):
+        try:
+            resp = requests.post(
+                "http://localhost:8000/api/v1/admin/purge-documents",
+                json={"confirm": True},
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success"):
+                    st.success(
+                        f"✅ Purge complete — "
+                        f"{data['documents_deleted']} document(s), "
+                        f"{data['vectors_deleted']} vector(s), "
+                        f"{data['files_deleted']} file(s) removed."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ Purge finished with errors: "
+                        f"{'; '.join(data.get('errors', []))}"
+                    )
+                # Show warnings
+                for w in data.get("warnings", []):
+                    st.info(f"ℹ️ {w}")
+
+                # Clear session-state document lists
+                for key in ("uploaded_docs", "indexed_docs"):
+                    if key in st.session_state:
+                        del st.session_state[key]
+            else:
+                st.error(f"❌ API error ({resp.status_code}): {resp.text[:300]}")
+        except requests.exceptions.ConnectionError:
+            st.error("❌ Cannot connect to API server. Is it running on port 8000?")
+        except Exception as e:
+            st.error(f"❌ Error: {e}")
+
+st.markdown("---")
+
 st.markdown("""
 <div style="text-align: center; color: #888;">
     <p>✅ After indexing documents, proceed to <b>World Model Builder</b> →</p>

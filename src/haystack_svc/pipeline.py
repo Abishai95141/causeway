@@ -631,6 +631,84 @@ class HaystackPipeline:
                 return len(ids_to_delete)
         return 0
 
+    async def delete_all_documents(self) -> int:
+        """Delete **every** vector in the collection.
+
+        In production mode this drops and recreates the Qdrant collection
+        via the REST API so no orphan points can remain.  In mock mode it
+        clears the in-memory/file-backed stores.
+
+        Returns:
+            Number of vectors that existed before the wipe.
+        """
+        if self._mock_mode:
+            count = len(self._mock_chunks)
+            self._mock_chunks.clear()
+            self._mock_embeddings.clear()
+            self._save_mock_store()
+            return count
+
+        if self._document_store is None:
+            return 0
+
+        # Count before drop
+        try:
+            count = self._document_store.count_documents()
+        except Exception:
+            count = 0
+
+        # Use Qdrant REST API directly to guarantee deletion
+        import httpx
+
+        base_url = f"http://{self.qdrant_host}:{self.qdrant_port}"
+        collection_url = f"{base_url}/collections/{self.collection_name}"
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                # Delete the collection
+                resp = await client.delete(collection_url)
+                resp.raise_for_status()
+
+                # Recreate with same config
+                create_payload = {
+                    "vectors": {
+                        "size": 384,
+                        "distance": "Cosine",
+                    }
+                }
+                resp = await client.put(collection_url, json=create_payload)
+                resp.raise_for_status()
+
+            logger.info(
+                "Qdrant collection '%s' dropped and recreated (%d vectors removed)",
+                self.collection_name, count,
+            )
+
+            # Reconnect the document store to the fresh collection
+            from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
+
+            self._document_store = QdrantDocumentStore(
+                host=self.qdrant_host,
+                port=self.qdrant_port,
+                index=self.collection_name,
+                embedding_dim=384,
+                recreate_index=False,
+            )
+            # Re-attach retriever to the fresh store
+            if self._retriever is not None:
+                from haystack_integrations.components.retrievers.qdrant import (
+                    QdrantEmbeddingRetriever,
+                )
+                self._retriever = QdrantEmbeddingRetriever(
+                    document_store=self._document_store,
+                    top_k=10,
+                )
+        except Exception as exc:
+            logger.error("Failed to recreate Qdrant collection: %s", exc)
+            raise
+
+        return count
+
     # ------------------------------------------------------------------ #
     # Mock helpers
     # ------------------------------------------------------------------ #

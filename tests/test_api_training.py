@@ -301,3 +301,49 @@ class TestTrajectoryStore:
         
         assert restored.trajectory_id == sample_trajectory.trajectory_id
         assert restored.mode == sample_trajectory.mode
+
+
+# ===== Purge Endpoint Tests =====
+
+class TestPurgeEndpoint:
+    """Test admin purge-documents endpoint."""
+
+    @pytest.fixture
+    def client(self):
+        """Create test client."""
+        return TestClient(app)
+
+    def test_purge_rejects_without_confirm(self, client):
+        """Should reject purge when confirm is false."""
+        response = client.post(
+            "/api/v1/admin/purge-documents",
+            json={"confirm": False},
+        )
+        assert response.status_code == 400
+        assert "not confirmed" in response.json()["detail"].lower()
+
+    def test_purge_accepts_with_confirm(self, client):
+        """Should accept and return PurgeResponse when confirm is true."""
+        response = client.post(
+            "/api/v1/admin/purge-documents",
+            json={"confirm": True},
+        )
+        # May succeed or partially fail depending on infra, but should not 400
+        assert response.status_code == 200
+        data = response.json()
+        assert "success" in data
+        assert "documents_deleted" in data
+        assert "vectors_deleted" in data
+        assert "files_deleted" in data
+        assert isinstance(data["errors"], list)
+        assert isinstance(data["warnings"], list)
+
+    def test_purge_response_has_pageindex_warning(self, client):
+        """Purge response should warn that PageIndex was not cleared."""
+        response = client.post(
+            "/api/v1/admin/purge-documents",
+            json={"confirm": True},
+        )
+        assert response.status_code == 200
+        warnings = response.json().get("warnings", [])
+        assert any("PageIndex" in w for w in warnings)

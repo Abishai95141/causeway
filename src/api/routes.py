@@ -913,3 +913,113 @@ async def protocol_status():
         "is_waiting_review": sm.is_waiting_review,
         "history": sm.get_state_history(),
     }
+
+
+# ===== Admin: Purge All Document Data =====
+
+class PurgeRequest(BaseModel):
+    """Request to purge all document data."""
+    confirm: bool = Field(
+        ...,
+        description="Must be True to execute. Safety guard against accidental calls.",
+    )
+
+
+class PurgeResponse(BaseModel):
+    """Response from purge operation."""
+    success: bool
+    documents_deleted: int = 0
+    vectors_deleted: int = 0
+    files_deleted: int = 0
+    errors: list[str] = []
+    warnings: list[str] = []
+
+
+@router.post("/admin/purge-documents", response_model=PurgeResponse)
+async def purge_all_documents(request: PurgeRequest):
+    """
+    Purge **all** document data across every local store.
+
+    Clears:
+    - Qdrant / Haystack vector chunks
+    - MinIO uploaded files
+    - PostgreSQL document-record rows
+
+    Does NOT touch: world models, evidence bundles, audit log, PageIndex.
+    Requires ``confirm=true`` in the request body.
+    """
+    if not request.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Purge not confirmed. Send confirm=true to proceed.",
+        )
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    documents_deleted = 0
+    vectors_deleted = 0
+    files_deleted = 0
+
+    # ── 1. Fetch all document records from PostgreSQL ────────────
+    doc_rows: list = []
+    try:
+        async with get_db_session() as session:
+            from sqlalchemy import select
+            from src.storage.database import DocumentRecordDB
+
+            result = await session.execute(select(DocumentRecordDB))
+            doc_rows = list(result.scalars().all())
+    except Exception as exc:
+        errors.append(f"DB fetch failed: {exc}")
+        logger.error("purge: DB fetch failed: %s", exc)
+
+    # ── 2. Drop + recreate the entire Qdrant collection ─────────
+    try:
+        retrieval = await get_retrieval_router()
+        vectors_deleted = await retrieval.haystack.delete_all_documents()
+    except Exception as exc:
+        errors.append(f"Vector store wipe failed: {exc}")
+        logger.error("purge: vector store wipe failed: %s", exc)
+
+    # ── 3. Delete files from MinIO ──────────────────────────────
+    try:
+        store = await get_object_store()
+        for row in doc_rows:
+            if row.storage_uri:
+                try:
+                    store.delete_file(row.storage_uri)
+                    files_deleted += 1
+                except Exception as exc:
+                    errors.append(f"MinIO delete failed for {row.storage_uri}: {exc}")
+    except Exception as exc:
+        errors.append(f"Object store init failed: {exc}")
+        logger.error("purge: object store init failed: %s", exc)
+
+    # ── 4. Delete document rows from PostgreSQL ─────────────────
+    try:
+        async with get_db_session() as session:
+            from sqlalchemy import delete as sa_delete
+            from src.storage.database import DocumentRecordDB
+
+            result = await session.execute(sa_delete(DocumentRecordDB))
+            documents_deleted = result.rowcount  # type: ignore[assignment]
+    except Exception as exc:
+        errors.append(f"DB delete failed: {exc}")
+        logger.error("purge: DB row delete failed: %s", exc)
+
+    # ── 5. Warnings ─────────────────────────────────────────────
+    warnings.append("PageIndex entries were NOT cleared (out of scope).")
+
+    logger.info(
+        "purge complete: docs=%d, vectors=%d, files=%d, errors=%d",
+        documents_deleted, vectors_deleted, files_deleted, len(errors),
+    )
+
+    return PurgeResponse(
+        success=len(errors) == 0,
+        documents_deleted=documents_deleted,
+        vectors_deleted=vectors_deleted,
+        files_deleted=files_deleted,
+        errors=errors,
+        warnings=warnings,
+    )

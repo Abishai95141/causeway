@@ -362,7 +362,11 @@ class HaystackService:
     async def delete_document(self, doc_id: str) -> int:
         """Delete all chunks for a document."""
         return await self.pipeline.delete_document(doc_id)
-    
+
+    async def delete_all_documents(self) -> int:
+        """Delete every vector in the collection (drop + recreate)."""
+        return await self.pipeline.delete_all_documents()
+
     def _chunk_to_evidence(
         self,
         chunk: ChunkResult,
