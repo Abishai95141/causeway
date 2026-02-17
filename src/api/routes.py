@@ -31,6 +31,7 @@ from src.protocol.state_machine import ProtocolStateMachine
 from src.protocol.mode_router import ModeRouter
 from src.agent.causeway_agent import CausewayAgent
 from src.models.enums import IngestionStatus, ModelStatus, OperatingMode
+from src.utils.text import truncate_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +287,7 @@ async def search_evidence(request: SearchRequest):
 
     results = [
         SearchResult(
-            content=b.content[:1000],
+            content=truncate_evidence(b.content, max_chars=1200),
             doc_id=b.source.doc_id,
             doc_title=b.source.doc_title,
             score=(

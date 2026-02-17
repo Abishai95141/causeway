@@ -3,6 +3,7 @@
 from functools import lru_cache
 from typing import Optional
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,3 +52,73 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()
+
+
+class VerificationConfig(BaseSettings):
+    """Configuration for the Agentic Verification Loop.
+
+    Controls the Proposer-Retriever-Judge pipeline that grounds
+    every causal edge in retrieved evidence before it enters the DAG.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="CAUSEWAY_VERIFY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Judge loop
+    max_judge_iterations: int = Field(
+        default=3,
+        description="Maximum retrieve→judge cycles per edge before forced failure",
+    )
+    grounding_confidence_threshold: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        description="Minimum judge confidence to accept an edge as grounded",
+    )
+    enable_adversarial_pass: bool = Field(
+        default=True,
+        description="Run a devil's-advocate pass on strong edges",
+    )
+
+    # Model selection
+    judge_model: str = Field(
+        default="gemini-2.5-pro",
+        description="LLM model for verification judge (needs strong reasoning)",
+    )
+
+    # Concurrency & rate-limiting
+    llm_semaphore_limit: int = Field(
+        default=8,
+        ge=1,
+        description="Max concurrent Gemini API calls (shared semaphore)",
+    )
+    max_retries: int = Field(
+        default=5,
+        ge=1,
+        description="Max retry attempts per LLM call",
+    )
+    backoff_base: float = Field(
+        default=2.0,
+        description="Base for exponential backoff (seconds)",
+    )
+    backoff_jitter_max: float = Field(
+        default=5.0,
+        description="Maximum random jitter added to backoff (seconds)",
+    )
+
+    # Retrieval
+    retrieval_top_k: int = Field(
+        default=5,
+        ge=1,
+        description="Top-K evidence chunks to retrieve per direction",
+    )
+
+
+@lru_cache
+def get_verification_config() -> VerificationConfig:
+    """Get cached verification config instance."""
+    return VerificationConfig()

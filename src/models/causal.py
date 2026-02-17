@@ -6,7 +6,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
-from src.models.enums import EvidenceStrength, MeasurementStatus, ModelStatus, VariableRole, VariableType
+from src.models.enums import EdgeStatus, EvidenceStrength, MeasurementStatus, ModelStatus, VariableRole, VariableType
 
 
 class VariableDefinition(BaseModel):
@@ -47,6 +47,14 @@ class EdgeMetadata(BaseModel):
     evidence_strength: EvidenceStrength = Field(
         default=EvidenceStrength.HYPOTHESIS,
         description="Classification based on evidence support"
+    )
+    edge_status: EdgeStatus = Field(
+        default=EdgeStatus.DRAFT,
+        description="Verification status of this edge (draft → grounded | rejected)"
+    )
+    rejection_reason: Optional[str] = Field(
+        default=None,
+        description="Why the verification judge rejected this edge (if edge_status=rejected)"
     )
     evidence_refs: list[UUID] = Field(
         default_factory=list,

@@ -21,9 +21,15 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
 from enum import Enum
+import asyncio
 import logging
 
-from src.extraction.service import ExtractionService
+from src.extraction.service import (
+    ExtractionService,
+    CanonicalVariableList,
+    SynthesizedMechanism,
+)
+from src.utils.text import truncate_evidence, canonicalize_var_id
 
 from src.agent.orchestrator import AgentOrchestrator
 from src.agent.llm_client import LLMClient
@@ -34,6 +40,7 @@ from src.retrieval.router import RetrievalRouter, RetrievalRequest, RetrievalStr
 from src.models.causal import WorldModelVersion, VariableDefinition, CausalEdge
 from src.models.evidence import EvidenceBundle
 from src.models.enums import (
+    EdgeStatus,
     EvidenceStrength,
     ModelStatus,
     VariableRole,
@@ -41,6 +48,7 @@ from src.models.enums import (
     MeasurementStatus,
 )
 from src.protocol.state_machine import ProtocolState
+from src.verification.loop import VerificationAgent, VerificationResult
 
 _logger = logging.getLogger(__name__)
 
@@ -130,6 +138,7 @@ class Mode1WorldModelConstruction:
         causal_service: Optional[CausalService] = None,
         causal_bridge: Optional[CausalGraphBridge] = None,
         extraction_service: Optional[ExtractionService] = None,
+        verification_agent: Optional[VerificationAgent] = None,
     ):
         self.llm = llm_client or LLMClient()
         self.retrieval = retrieval_router or RetrievalRouter()
@@ -145,6 +154,17 @@ class Mode1WorldModelConstruction:
 
         # Centralised extraction service
         self.extraction = extraction_service or ExtractionService()
+
+        # Agentic verification loop
+        if verification_agent is not None:
+            self.verifier = verification_agent
+        else:
+            from src.training.spans import SpanCollector
+            self.verifier = VerificationAgent(
+                llm_client=self.llm,
+                retrieval_router=self.retrieval,
+                span_collector=SpanCollector(enabled=True),
+            )
         
         self._current_stage = Mode1Stage.VARIABLE_DISCOVERY
         self._evidence_cache: dict[str, EvidenceBundle] = {}
@@ -193,6 +213,14 @@ class Mode1WorldModelConstruction:
                 trace_id, "variable_discovery_complete", 
                 {"count": len(variables)}
             ))
+
+            # Stage 1.5: Variable Canonicalization — merge semantic duplicates
+            raw_count = len(variables)
+            variables = await self._canonicalize_variables(variables, domain)
+            audit_entries.append(self._create_audit(
+                trace_id, "variable_canonicalization_complete",
+                {"raw_count": raw_count, "canonical_count": len(variables)}
+            ))
             
             # Stage 2: Evidence Gathering
             self._current_stage = Mode1Stage.EVIDENCE_GATHERING
@@ -209,21 +237,46 @@ class Mode1WorldModelConstruction:
                 trace_id, "dag_drafting_complete",
                 {"edge_count": len(edges)}
             ))
-            
-            # Stage 4: Evidence Triangulation
-            self._current_stage = Mode1Stage.EVIDENCE_TRIANGULATION
-            await self._triangulate_evidence(edges)
-            supporting_total = sum(len(e.evidence_refs) for e in edges)
-            contradicting_total = sum(len(e.contradicting_refs) for e in edges)
-            contested_count = sum(
-                1 for e in edges if e.strength == EvidenceStrength.CONTESTED
-            )
+
+            # Stage 3.5: Mechanism Synthesis — replace raw evidence
+            # copy-paste with LLM-synthesized causal reasoning
+            edges = await self._synthesize_mechanisms(edges)
             audit_entries.append(self._create_audit(
-                trace_id, "evidence_triangulation_complete",
+                trace_id, "mechanism_synthesis_complete",
+                {"edges_synthesized": len(edges)}
+            ))
+            
+            # Stage 4: Agentic Verification Loop
+            # Replaces naive triangulation with Proposer-Retriever-Judge
+            self._current_stage = Mode1Stage.EVIDENCE_TRIANGULATION
+
+            edge_dicts = [
                 {
-                    "linked_evidence": supporting_total,
-                    "contradicting_evidence": contradicting_total,
-                    "contested_edges": contested_count,
+                    "from_var": e.from_var,
+                    "to_var": e.to_var,
+                    "mechanism": e.mechanism,
+                    "evidence_strength": e.strength.value if isinstance(e.strength, EvidenceStrength) else str(e.strength),
+                }
+                for e in edges
+            ]
+            verification_results = await self.verifier.verify_all_edges(
+                edge_dicts,
+                doc_ids=doc_ids,
+                trace_id=trace_id,
+            )
+
+            grounded_count = sum(1 for vr in verification_results if vr.grounded)
+            rejected_count = len(verification_results) - grounded_count
+            audit_entries.append(self._create_audit(
+                trace_id, "verification_loop_complete",
+                {
+                    "total_edges": len(verification_results),
+                    "grounded": grounded_count,
+                    "rejected": rejected_count,
+                    "rejection_reasons": [
+                        {"edge": f"{vr.from_var}->{vr.to_var}", "reason": vr.rejection_reason}
+                        for vr in verification_results if not vr.grounded
+                    ],
                 }
             ))
             
@@ -231,11 +284,9 @@ class Mode1WorldModelConstruction:
             engine = self.causal.create_world_model(domain)
             
             # Add variables
-            import re as _re
             added_var_ids: set[str] = set()
             for var in variables:
-                # Sanitize: lowercase, replace non-alphanum with _, collapse runs
-                var_id = _re.sub(r'[^a-z0-9]+', '_', var.name.lower()).strip('_')
+                var_id = canonicalize_var_id(var.name)
                 if not var_id or var_id in added_var_ids:
                     _logger.warning("Variable skipped (empty or dup): name=%r id=%r", var.name, var_id)
                     continue
@@ -259,7 +310,7 @@ class Mode1WorldModelConstruction:
             # try to find the closest match among added variables.
             def _resolve_var_id(raw_id: str) -> str:
                 """Resolve a possibly-abbreviated variable ID to an actual one."""
-                sanitized = _re.sub(r'[^a-z0-9]+', '_', raw_id.lower()).strip('_')
+                sanitized = canonicalize_var_id(raw_id)
                 if sanitized in added_var_ids:
                     return sanitized
                 # Try suffix match: "customer_traffic" should match "daily_customer_traffic"
@@ -279,32 +330,61 @@ class Mode1WorldModelConstruction:
                     return contained_in[0]
                 return sanitized  # fallback to exact sanitized form
 
-            # Add edges with full evidence metadata
+            # Add ONLY grounded edges — rejected edges are soft-pruned
             edges_added = 0
-            for edge in edges:
+            rejected_edges_audit: list[dict] = []
+            for vr in verification_results:
+                if not vr.grounded:
+                    rejected_edges_audit.append({
+                        "edge": f"{vr.from_var}->{vr.to_var}",
+                        "reason": vr.rejection_reason,
+                        "iterations": vr.iterations_used,
+                    })
+                    continue
+
                 try:
-                    # Sanitize edge variable references and resolve via fuzzy matching
-                    from_id = _resolve_var_id(edge.from_var)
-                    to_id = _resolve_var_id(edge.to_var)
-                    _logger.info("Attempting edge: %s → %s (raw: %s → %s)",
-                                 from_id, to_id, edge.from_var, edge.to_var)
+                    from_id = _resolve_var_id(vr.from_var)
+                    to_id = _resolve_var_id(vr.to_var)
+
+                    # Build evidence refs from the supporting bundle
+                    evidence_bundle_ids: list[UUID] = []
+                    if vr.supporting_bundle:
+                        evidence_bundle_ids.append(vr.supporting_bundle.bundle_id)
+                        self._evidence_cache[vr.supporting_bundle.content_hash[:12]] = vr.supporting_bundle
+
+                    # Map original EdgeCandidate strength
+                    original_edge = next(
+                        (e for e in edges if e.from_var == vr.from_var and e.to_var == vr.to_var),
+                        None,
+                    )
+                    strength = original_edge.strength if original_edge else EvidenceStrength.HYPOTHESIS
+
+                    _logger.info("Adding grounded edge: %s → %s (confidence=%.2f)",
+                                 from_id, to_id, vr.confidence)
                     engine.add_edge(
                         from_var=from_id,
                         to_var=to_id,
-                        mechanism=edge.mechanism,
-                        strength=edge.strength,
-                        evidence_refs=edge.evidence_bundle_ids or None,
-                        confidence=edge.confidence,
-                        assumptions=edge.assumptions or None,
-                        conditions=edge.conditions or None,
-                        contradicting_refs=edge.contradicting_bundle_ids or None,
+                        mechanism=vr.mechanism,
+                        strength=strength,
+                        evidence_refs=evidence_bundle_ids or None,
+                        confidence=vr.confidence,
+                        assumptions=vr.assumptions or None,
+                        conditions=vr.conditions or None,
                     )
                     edges_added += 1
                 except Exception as _edge_err:
-                    _logger.warning("Edge %s→%s skipped: %s", from_id, to_id, _edge_err)
+                    _logger.warning("Grounded edge %s→%s skipped: %s",
+                                    vr.from_var, vr.to_var, _edge_err)
                     continue
 
-            _logger.info("Added %d/%d edges to engine", edges_added, len(edges))
+            _logger.info("Added %d/%d grounded edges to engine (%d rejected)",
+                         edges_added, len(verification_results), len(rejected_edges_audit))
+
+            if rejected_edges_audit:
+                audit_entries.append(self._create_audit(
+                    trace_id, "rejected_edges_detail",
+                    {"rejected": rejected_edges_audit},
+                ))
 
             # Stage 4.5: Post-build conflict detection (Phase 3)
             all_evidence = list(self._evidence_cache.values())
@@ -387,7 +467,7 @@ class Mode1WorldModelConstruction:
 
         # Build plain-text evidence document for LangExtract
         evidence_text = "\n\n".join(
-            e.content[:500] for e in evidence[:10]
+            truncate_evidence(e.content, max_chars=800) for e in evidence[:10]
         )
 
         # If too little text, broaden the search
@@ -408,7 +488,7 @@ class Mode1WorldModelConstruction:
                     seen.add(e.content_hash)
                     self._evidence_cache[e.content_hash[:12]] = e
             evidence_text = "\n\n".join(
-                e.content[:500] for e in evidence[:15]
+                truncate_evidence(e.content, max_chars=800) for e in evidence[:15]
             )
 
         # ── ExtractionService: structured variable extraction ─────────
@@ -453,6 +533,279 @@ class Mode1WorldModelConstruction:
 
         self._variable_candidates = variables[:max_variables]
         return self._variable_candidates
+
+    # ── Variable Canonicalization ───────────────────────────────────────
+
+    _CANONICALIZATION_SYSTEM_PROMPT = (
+        "You are a senior data-modelling expert specialising in causal "
+        "inference.  Your task is to consolidate a raw list of candidate "
+        "causal variables by merging semantic duplicates.\n\n"
+        "RULES:\n"
+        "1. Two variables are duplicates if they refer to the SAME "
+        "   real-world concept, even when worded differently "
+        '   (e.g. "freshest herbs", "highest quality herbs", '
+        '   "select herbs" → merge into "Herb Quality").\n'
+        "2. Keep variables SEPARATE when they measure genuinely "
+        "   different things, even if they are related "
+        '   (e.g. "Revenue" and "Profit Margin" are distinct).\n'
+        "3. For each merged group, choose the MOST general and precise "
+        '   canonical_name (e.g. "Pricing" not "price drops").\n'
+        "4. Preserve the var_type and measurement_status of the most "
+        "   informative member of each group.\n"
+        "5. merged_from MUST list every original variable name in the "
+        "   group, even singleton groups.\n"
+        "6. Return ONLY the deduplicated list — do NOT invent new "
+        "   variables that were not in the input."
+    )
+
+    async def _canonicalize_variables(
+        self,
+        variables: list[VariableCandidate],
+        domain: str,
+    ) -> list[VariableCandidate]:
+        """Merge semantically-duplicate variables using an LLM call.
+
+        Takes the raw ``VariableCandidate`` list from ``_discover_variables``
+        and asks the LLM to group synonymous concepts into single canonical
+        entries.  Uses ``generate_structured_native`` with
+        :class:`CanonicalVariableList` to guarantee valid JSON output.
+
+        Falls back to returning *variables* unchanged if the LLM call
+        fails for any reason (network, quota, parse error) so that the
+        pipeline is never blocked.
+        """
+        if len(variables) <= 1:
+            return variables
+
+        # Build the prompt listing all candidates
+        var_lines: list[str] = []
+        for i, v in enumerate(variables, 1):
+            var_lines.append(
+                f"{i}. \"{v.name}\" — {v.description}  "
+                f"[type={v.var_type.value}, status={v.measurement_status.value}]"
+            )
+        var_block = "\n".join(var_lines)
+
+        prompt = (
+            f"Domain: {domain}\n\n"
+            f"## Raw candidate variables ({len(variables)} total)\n"
+            f"{var_block}\n\n"
+            "Merge any semantic duplicates and return the consolidated list."
+        )
+
+        try:
+            result: CanonicalVariableList = (
+                await self.llm.generate_structured_native(
+                    prompt=prompt,
+                    output_schema=CanonicalVariableList,
+                    system_prompt=self._CANONICALIZATION_SYSTEM_PROMPT,
+                )
+            )
+        except Exception as exc:
+            _logger.warning(
+                "Variable canonicalization LLM call failed — returning "
+                "raw variables unchanged: %s",
+                exc,
+            )
+            return variables
+
+        # Build a lookup so we can carry over evidence_sources from the
+        # original VariableCandidates that were merged.
+        originals_by_lower: dict[str, VariableCandidate] = {
+            v.name.lower(): v for v in variables
+        }
+
+        canonical: list[VariableCandidate] = []
+        for cv in result.variables:
+            # Collect evidence sources from every merged original
+            merged_evidence: list[str] = []
+            for src_name in cv.merged_from:
+                orig = originals_by_lower.get(src_name.lower())
+                if orig:
+                    for key in orig.evidence_sources:
+                        if key not in merged_evidence:
+                            merged_evidence.append(key)
+
+            canonical.append(VariableCandidate(
+                name=cv.canonical_name,
+                description=cv.description,
+                var_type=(
+                    VariableType(cv.var_type)
+                    if cv.var_type in ["continuous", "discrete", "binary", "categorical"]
+                    else VariableType.CONTINUOUS
+                ),
+                measurement_status=(
+                    MeasurementStatus(cv.measurement_status)
+                    if cv.measurement_status in ["measured", "observable", "latent"]
+                    else MeasurementStatus.MEASURED
+                ),
+                evidence_sources=merged_evidence,
+            ))
+
+        merged_count = len(variables) - len(canonical)
+        if merged_count > 0:
+            _logger.info(
+                "Canonicalization merged %d → %d variables (-%d)",
+                len(variables), len(canonical), merged_count,
+            )
+            for cv in result.variables:
+                if len(cv.merged_from) > 1:
+                    _logger.info(
+                        "  Merged group: %s → \"%s\"  (%s)",
+                        cv.merged_from, cv.canonical_name, cv.merge_reasoning,
+                    )
+        else:
+            _logger.info(
+                "Canonicalization kept all %d variables (no merges needed)",
+                len(canonical),
+            )
+
+        return canonical
+
+    # ── Mechanism Synthesis ──────────────────────────────────────────────
+
+    _MECHANISM_SYNTHESIS_SYSTEM_PROMPT = (
+        "You are a senior causal inference expert.  Your task is to "
+        "produce a concise, high-quality description of a causal "
+        "mechanism based on retrieved evidence.\n\n"
+        "RULES:\n"
+        "1. `rationale_in_own_words` — Explain HOW the cause produces "
+        "   the effect in 1–2 sentences.  Use YOUR OWN words.  Describe "
+        "   the real-world causal pathway (e.g. biological process, "
+        "   economic mechanism, operational chain).  NEVER copy-paste "
+        "   text from the evidence — rephrase it completely.\n"
+        "2. `exact_quote` — Copy the single most relevant sentence (or "
+        "   clause) from the evidence VERBATIM.  Do not paraphrase, "
+        "   truncate, or edit it.  If no suitable quote exists write "
+        "   'N/A'.\n"
+        "3. `source_citation` — Document title and section of the "
+        "   exact_quote (e.g. 'Business_Plan.pdf, Section 3.2').  "
+        "   Leave empty if exact_quote is 'N/A'.\n\n"
+        "ANTI-PATTERN (FORBIDDEN):\n"
+        "  rationale_in_own_words = 'The business plan states that "
+        "  marketing spend drives customer acquisition through ...'\n"
+        "  ↑ This is just rewording the evidence.  Instead explain the "
+        "  actual mechanism: 'Marketing spend increases brand visibility "
+        "  and reach, which expands the top of the acquisition funnel "
+        "  and converts previously-unaware prospects into customers.'"
+    )
+
+    async def _synthesize_mechanisms(
+        self,
+        edges: list["EdgeCandidate"],
+    ) -> list["EdgeCandidate"]:
+        """Replace raw/placeholder mechanism strings with LLM-synthesized text.
+
+        For each edge, gathers matching evidence from ``_evidence_cache``,
+        calls ``generate_structured_native`` with :class:`SynthesizedMechanism`,
+        and reformats the result into a clean mechanism string:
+
+            "{rationale}. (Evidence: '{quote}' — {citation})"
+
+        Falls back to the original mechanism on any per-edge failure so the
+        pipeline is never blocked.
+        """
+        if not edges:
+            return edges
+
+        async def _synthesize_one(edge: "EdgeCandidate") -> None:
+            """Synthesize mechanism for a single edge (mutates in place)."""
+            # Gather up to 3 evidence snippets that mention both variables
+            relevant_bundles: list[EvidenceBundle] = []
+            from_lower = edge.from_var.replace("_", " ")
+            to_lower = edge.to_var.replace("_", " ")
+            for eb in self._evidence_cache.values():
+                content_lower = eb.content.lower()
+                if (
+                    (from_lower in content_lower or edge.from_var in content_lower)
+                    and (to_lower in content_lower or edge.to_var in content_lower)
+                ):
+                    relevant_bundles.append(eb)
+                    if len(relevant_bundles) >= 3:
+                        break
+
+            # If we didn't find bundles mentioning both, broaden to any
+            if not relevant_bundles:
+                for eb in self._evidence_cache.values():
+                    content_lower = eb.content.lower()
+                    if from_lower in content_lower or to_lower in content_lower:
+                        relevant_bundles.append(eb)
+                        if len(relevant_bundles) >= 3:
+                            break
+
+            if not relevant_bundles:
+                _logger.debug(
+                    "No evidence for mechanism synthesis: %s→%s",
+                    edge.from_var, edge.to_var,
+                )
+                return  # keep existing mechanism unchanged
+
+            # Build evidence block for the prompt
+            ev_parts: list[str] = []
+            for i, eb in enumerate(relevant_bundles, 1):
+                source = eb.source.doc_title or eb.source.doc_id
+                loc_parts: list[str] = []
+                if eb.location.section_name:
+                    loc_parts.append(eb.location.section_name)
+                if eb.location.page_number:
+                    loc_parts.append(f"p.{eb.location.page_number}")
+                loc = ", ".join(loc_parts) if loc_parts else "unknown section"
+                snippet = truncate_evidence(eb.content, max_chars=600)
+                ev_parts.append(
+                    f"### Chunk {i} [{source} — {loc}]\n{snippet}\n"
+                )
+            evidence_block = "\n".join(ev_parts)
+
+            prompt = (
+                f"## Proposed causal edge\n"
+                f"- **Cause:** {edge.from_var}\n"
+                f"- **Effect:** {edge.to_var}\n"
+                f"- **Draft mechanism (may be low-quality):** "
+                f"{edge.mechanism}\n\n"
+                f"## Retrieved evidence\n{evidence_block}\n\n"
+                f"Synthesize the causal mechanism."
+            )
+
+            try:
+                result: SynthesizedMechanism = (
+                    await self.llm.generate_structured_native(
+                        prompt=prompt,
+                        output_schema=SynthesizedMechanism,
+                        system_prompt=self._MECHANISM_SYNTHESIS_SYSTEM_PROMPT,
+                    )
+                )
+            except Exception as exc:
+                _logger.warning(
+                    "Mechanism synthesis failed for %s→%s — keeping "
+                    "original: %s",
+                    edge.from_var, edge.to_var, exc,
+                )
+                return  # keep existing mechanism
+
+            # Format the final mechanism string
+            rationale = result.rationale_in_own_words.strip()
+            quote = result.exact_quote.strip()
+            citation = result.source_citation.strip()
+
+            if quote and quote.upper() != "N/A":
+                cite_suffix = f" — {citation}" if citation else ""
+                edge.mechanism = (
+                    f"{rationale} (Evidence: '{quote}'{cite_suffix})"
+                )
+            else:
+                edge.mechanism = rationale
+
+        # Run all synthesis calls concurrently (LLMClient semaphore
+        # gates the actual API concurrency).
+        await asyncio.gather(
+            *[_synthesize_one(e) for e in edges],
+            return_exceptions=True,   # don't let one failure abort all
+        )
+
+        _logger.info(
+            "Mechanism synthesis complete for %d edges", len(edges),
+        )
+        return edges
     
     async def _gather_evidence(
         self,
@@ -498,10 +851,8 @@ class Mode1WorldModelConstruction:
 
         Every edge's extraction_text is matched back to evidence bundles.
         """
-        import re as _re
-
         var_ids = [
-            _re.sub(r'[^a-z0-9]+', '_', v.name.lower()).strip('_')
+            canonicalize_var_id(v.name)
             for v in variables
         ]
         var_ids = list(dict.fromkeys(vid for vid in var_ids if vid))
@@ -509,7 +860,7 @@ class Mode1WorldModelConstruction:
         # Build evidence map keyed by variable ID (for PyWhyLLM)
         evidence_by_var: dict[str, list[EvidenceBundle]] = {}
         for var in variables:
-            var_id = _re.sub(r'[^a-z0-9]+', '_', var.name.lower()).strip('_')
+            var_id = canonicalize_var_id(var.name)
             if not var_id:
                 continue
             matching = [
@@ -551,7 +902,7 @@ class Mode1WorldModelConstruction:
 
         # ── Stage B: ExtractionService — grounded causal edge extraction ─
         evidence_text = "\n\n".join(
-            eb.content[:500] for eb in list(self._evidence_cache.values())[:15]
+            truncate_evidence(eb.content, max_chars=800) for eb in list(self._evidence_cache.values())[:15]
         )
 
         var_names = [v.name for v in variables]
@@ -611,7 +962,7 @@ class Mode1WorldModelConstruction:
         # Apply variable role classifications from bridge
         for vc in bridge_result.variable_classifications:
             for var_cand in variables:
-                var_id = _re.sub(r'[^a-z0-9]+', '_', var_cand.name.lower()).strip('_')
+                var_id = canonicalize_var_id(var_cand.name)
                 if var_id == vc.variable_id:
                     var_cand.role = vc.role
                     break

@@ -32,6 +32,7 @@ from src.models.enums import (
     VariableType,
 )
 from src.models.evidence import EvidenceBundle
+from src.utils.text import truncate_at_sentence_boundary
 
 _logger = logging.getLogger(__name__)
 
@@ -495,31 +496,22 @@ class CausalGraphBridge:
         to_var: str,
         evidence_bundles: list[EvidenceBundle],
     ) -> str:
-        """
-        Build a mechanism description that cites specific documents.
+        """Return a *placeholder* mechanism string.
 
-        Example output:
-            "Price increases reduce demand through elasticity effects
-            (Q3_Postmortem.pdf, Section 4.2; Pricing_Policy_v7.docx, Section 2.1)"
+        Real mechanism synthesis is now performed by
+        ``Mode1WorldModelBuilder._synthesize_mechanisms()`` which calls
+        the LLM with a strict two-field schema
+        (``SynthesizedMechanism``) to separate rationale from verbatim
+        evidence.  This method only provides a lightweight fallback so
+        that ``EdgeProposal.mechanism`` is never empty before that
+        synthesis stage runs.
         """
         if not evidence_bundles:
-            return f"{from_var} affects {to_var} (no supporting evidence)"
+            return f"{from_var} affects {to_var} (pending synthesis — no evidence)"
 
-        # Build citation list
-        citations: list[str] = []
-        for eb in evidence_bundles[:5]:  # cap at 5 citations
-            cite_parts = [eb.source.doc_title]
-            if eb.location.section_name:
-                cite_parts.append(f"Section: {eb.location.section_name}")
-            if eb.location.page_number:
-                cite_parts.append(f"p.{eb.location.page_number}")
-            citations.append(", ".join(cite_parts))
-
-        citation_str = "; ".join(citations)
-
-        # Use first evidence snippet to describe mechanism
-        snippet = evidence_bundles[0].content[:200].strip()
-        return f"{snippet}... ({citation_str})"
+        # Lightweight citation hint (the full synthesis adds the real quote)
+        cite = evidence_bundles[0].source.doc_title or "unknown source"
+        return f"{from_var} influences {to_var} (pending synthesis — see {cite})"
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -551,9 +543,12 @@ class CausalGraphBridge:
 
         strength, confidence = self.classify_edge_strength(len(supporting))
 
+        # Always use the placeholder — real synthesis happens in
+        # Mode1WorldModelBuilder._synthesize_mechanisms() after DAG
+        # drafting and before the verification loop.
         mechanism = self.extract_mechanism_from_evidence(
             from_var, to_var, supporting_bundles,
-        ) if supporting_bundles else pywhyllm_description
+        )
 
         # Default causal assumptions
         assumptions = [

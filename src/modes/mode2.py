@@ -14,7 +14,6 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from uuid import UUID, uuid4
 from enum import Enum
-import os
 import textwrap
 
 from src.extraction.service import ExtractionService
@@ -333,45 +332,16 @@ class Mode2DecisionSupport:
         If *available_domains* is provided the prompt is augmented so the
         LLM picks a domain from the known list instead of hallucinating.
         """
-        from src.config import get_settings
-        api_key = get_settings().google_ai_api_key
-
-        prompt = self.QUERY_EXTRACT_PROMPT
-        if available_domains:
-            prompt += (
-                f"\n\nCRITICAL CONSTRAINT: The 'domain' attribute MUST be "
-                f"one of these available domains: {', '.join(available_domains)}. "
-                f"Pick the single best match for the user's query."
-            )
-
-        result = lx.extract(
-            text_or_documents=query,
-            prompt_description=prompt,
-            examples=self.QUERY_EXTRACT_EXAMPLES,
-            model_id="gemini-2.5-flash",
-            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
-            show_progress=False,
+        extracted = self.extraction.parse_query(
+            query=query,
+            available_domains=available_domains,
         )
 
-        for ext in (result.extractions or []):
-            if ext.extraction_class == "decision_query":
-                attrs = ext.attributes or {}
-                return ParsedQuery(
-                    domain=attrs.get("domain", "general"),
-                    intervention=attrs.get("intervention", "unknown action"),
-                    target_outcome=attrs.get("target_outcome", "unknown outcome"),
-                    constraints=(
-                        [c.strip() for c in attrs.get("constraints", "").split(",")]
-                        if attrs.get("constraints")
-                        else []
-                    ),
-                )
-
-        # Fallback if LangExtract finds nothing
         return ParsedQuery(
-            domain="general",
-            intervention="the proposed action",
-            target_outcome="business outcomes",
+            domain=extracted.domain,
+            intervention=extracted.intervention,
+            target_outcome=extracted.target_outcome,
+            constraints=extracted.constraints,
         )
     
     async def _refresh_evidence(
@@ -438,8 +408,8 @@ class Mode2DecisionSupport:
         insights: list[CausalInsight],
         evidence: list[EvidenceBundle],
     ) -> DecisionRecommendation:
-        """Synthesize recommendation using LangExtract with grounded evidence."""
-        # Build analysis context text for LangExtract
+        """Synthesize recommendation using ExtractionService with grounded evidence."""
+        # Build analysis context text
         paths_text = "No causal paths found in model"
         confounders_text = "None identified"
         mediators_text = "None identified"
@@ -466,70 +436,42 @@ class Mode2DecisionSupport:
             f"Evidence:\n{evidence_text}"
         )
 
-        from src.config import get_settings
-        api_key = get_settings().google_ai_api_key
+        # Build evidence map for citation validation
+        evidence_map = {
+            eb.content_hash[:12]: eb.content[:200]
+            for eb in evidence
+        }
 
-        result = lx.extract(
-            text_or_documents=full_text,
-            prompt_description=self.RECOMMENDATION_EXTRACT_PROMPT,
-            examples=self.RECOMMENDATION_EXTRACT_EXAMPLES,
-            model_id="gemini-2.5-flash",
-            api_key=api_key or os.environ.get("LANGEXTRACT_API_KEY"),
-            show_progress=False,
+        extracted = self.extraction.synthesize_recommendation(
+            context_text=full_text,
+            evidence_map=evidence_map,
         )
 
-        # Map extractions → DecisionRecommendation with grounded evidence refs
-        for ext in (result.extractions or []):
-            if ext.extraction_class != "recommendation_claim":
-                continue
-            attrs = ext.attributes or {}
+        confidence_map = {
+            "high": ConfidenceLevel.HIGH,
+            "medium": ConfidenceLevel.MEDIUM,
+            "low": ConfidenceLevel.LOW,
+        }
 
-            # Provenance: match extraction_text to evidence bundles
-            grounded_ids: list[UUID] = []
-            quote = ext.extraction_text.lower()
+        # Map grounded evidence keys back to UUIDs
+        grounded_ids: list[UUID] = []
+        for key in extracted.grounded_evidence_keys:
             for eb in evidence:
-                if quote in eb.content.lower():
+                if eb.content_hash[:12] == key:
                     grounded_ids.append(eb.bundle_id)
+                    break
 
-            confidence_map = {
-                "high": ConfidenceLevel.HIGH,
-                "medium": ConfidenceLevel.MEDIUM,
-                "low": ConfidenceLevel.LOW,
-            }
-
-            actions_raw = attrs.get("actions", "")
-            risks_raw = attrs.get("risks", "")
-
-            return DecisionRecommendation(
-                recommendation=attrs.get("recommendation", "Unable to provide recommendation"),
-                confidence=confidence_map.get(
-                    attrs.get("confidence", "medium").lower(),
-                    ConfidenceLevel.MEDIUM,
-                ),
-                expected_outcome=attrs.get("reasoning", ""),
-                suggested_actions=(
-                    [a.strip() for a in actions_raw.split(",")]
-                    if isinstance(actions_raw, str) and actions_raw
-                    else actions_raw if isinstance(actions_raw, list) else []
-                ),
-                risks=(
-                    [r.strip() for r in risks_raw.split(",")]
-                    if isinstance(risks_raw, str) and risks_raw
-                    else risks_raw if isinstance(risks_raw, list) else []
-                ),
-                evidence_refs=grounded_ids,
-            )
-
-        # Fallback
         return DecisionRecommendation(
-            recommendation="Unable to synthesize recommendation from analysis",
-            confidence=ConfidenceLevel.LOW,
-            expected_outcome="Unknown",
-            suggested_actions=[],
-            risks=["Analysis may be incomplete"],
-            evidence_refs=[],
+            recommendation=extracted.recommendation,
+            confidence=confidence_map.get(
+                extracted.confidence, ConfidenceLevel.MEDIUM
+            ),
+            expected_outcome=extracted.reasoning,
+            suggested_actions=extracted.actions,
+            risks=extracted.risks,
+            evidence_refs=grounded_ids,
         )
-    
+
     # ── Legacy regex extractors removed ─────────────────────────────
     # _extract_parsed_query and _extract_recommendation have been
     # replaced by LangExtract structured extraction (see _parse_query

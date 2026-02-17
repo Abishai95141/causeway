@@ -25,6 +25,7 @@ from uuid import UUID
 from src.models.causal import CausalEdge, EdgeMetadata
 from src.models.enums import EvidenceStrength
 from src.models.evidence import EvidenceBundle
+from src.utils.text import truncate_at_sentence_boundary
 
 logger = logging.getLogger(__name__)
 
@@ -254,11 +255,11 @@ class ConflictDetector:
             has_reversal = self._has_reversal_signal(text_lower, from_tok, to_tok)
 
             if has_reversal:
-                reversal_evidence.append(bundle.content[:200])
+                reversal_evidence.append(truncate_at_sentence_boundary(bundle.content, max_chars=300))
             elif has_negation:
-                contradicting.append(bundle.content[:200])
+                contradicting.append(truncate_at_sentence_boundary(bundle.content, max_chars=300))
             else:
-                supporting.append(bundle.content[:200])
+                supporting.append(truncate_at_sentence_boundary(bundle.content, max_chars=300))
 
         # Build conflicts
         seq = 0
@@ -342,7 +343,7 @@ class ConflictDetector:
 
             # Check if any evidence mentions this term
             mentions = [
-                b.content[:200] for b in fresh_evidence
+                truncate_at_sentence_boundary(b.content, max_chars=300) for b in fresh_evidence
                 if term_lower in b.content.lower()
             ]
             if mentions:

@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from src.agent.llm_client import ToolDefinition
 from src.pageindex.client import PageIndexClient
+from src.utils.text import truncate_evidence
 
 
 def _section_to_dict(section: Any) -> dict[str, Any]:
@@ -28,7 +29,7 @@ def _section_to_dict(section: Any) -> dict[str, Any]:
         "section_name": section.section_name,
         "section_number": section.section_number,
         "page_number": section.page_number,
-        "content": section.content[:500],  # Truncate for context budget
+        "content": truncate_evidence(section.content, max_chars=800),
         "parent_sections": section.parent_sections,
     }
 

@@ -11,11 +11,21 @@ Wrapper for Google Gemini API with:
 import asyncio
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional, Type, TypeVar
 from enum import Enum
+
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+    before_sleep_log,
+    RetryError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +81,7 @@ class LLMClient:
         model: LLMModel = LLMModel.GEMINI_FLASH,
         max_retries: int = 5,
         timeout: float = 60.0,
+        semaphore_limit: int = 8,
     ):
         settings = get_settings()
         self.api_key = api_key or settings.google_ai_api_key
@@ -79,6 +90,7 @@ class LLMClient:
         self.timeout = timeout
         self._client = None
         self._mock_mode = self.api_key is None
+        self._semaphore = asyncio.Semaphore(semaphore_limit)
         
         # Mock responses for testing
         self._mock_responses: list[str] = []
@@ -133,12 +145,13 @@ class LLMClient:
 
         for attempt in range(self.max_retries):
             try:
-                response = await asyncio.to_thread(
-                    self._client.models.generate_content,
-                    model=self.model.value,
-                    contents=full_prompt,
-                    config=config,
-                )
+                async with self._semaphore:
+                    response = await asyncio.to_thread(
+                        self._client.models.generate_content,
+                        model=self.model.value,
+                        contents=full_prompt,
+                        config=config,
+                    )
                 
                 latency = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
                 
@@ -177,16 +190,20 @@ class LLMClient:
 
     @staticmethod
     def _get_retry_delay(error: Exception, attempt: int) -> float:
-        """Extract retry delay from rate-limit errors, or use exponential backoff."""
+        """Extract retry delay from rate-limit errors, or use exponential backoff with jitter."""
         import re as _re
         err_str = str(error)
         if '429' in err_str or 'RESOURCE_EXHAUSTED' in err_str:
             # Try to parse the suggested retry delay
             match = _re.search(r'retryDelay.*?(\d+)', err_str)
             if match:
-                return float(match.group(1)) + 2  # Add buffer
-            return 30.0  # Default 30s for rate limits
-        return 2 ** attempt  # Normal exponential backoff
+                base = float(match.group(1)) + 2  # Add buffer
+            else:
+                base = 30.0  # Default 30s for rate limits
+            # Add jitter to prevent thundering herd
+            return base * (0.5 + random.random())
+        base = 2 ** attempt
+        return base * (0.5 + random.random())  # Jittered exponential backoff
 
     async def generate_structured(
         self,
@@ -225,7 +242,98 @@ Respond ONLY with the JSON, no other text."""
         # Parse JSON from response
         json_data = self._extract_json(response.content)
         return output_schema.model_validate(json_data)
-    
+
+    async def generate_structured_native(
+        self,
+        prompt: str,
+        output_schema: Type[T],
+        system_prompt: Optional[str] = None,
+        model_override: Optional[LLMModel] = None,
+    ) -> T:
+        """
+        Generate structured output using Gemini's native response_schema.
+
+        Unlike ``generate_structured`` (which injects JSON schema into
+        the prompt and regex-parses the response), this method uses
+        ``response_mime_type="application/json"`` and ``response_schema``
+        so the API guarantees valid JSON conforming to the schema.
+
+        Falls back to the prompt-injection method in mock mode.
+
+        Args:
+            prompt:         User prompt
+            output_schema:  Pydantic model class for the response
+            system_prompt:  Optional system instructions
+            model_override: Use a different model (e.g. gemini-2.5-pro for judge)
+
+        Returns:
+            Validated instance of *output_schema*
+        """
+        if self._mock_mode:
+            return await self.generate_structured(
+                prompt=prompt,
+                output_schema=output_schema,
+                system_prompt=system_prompt,
+            )
+
+        from google.genai import types as genai_types
+
+        full_prompt = prompt
+        if system_prompt:
+            full_prompt = f"{system_prompt}\n\n{prompt}"
+
+        # Convert Pydantic JSON Schema → Gemini-compatible schema subset
+        json_schema = output_schema.model_json_schema()
+        gemini_schema = self._jsonschema_to_gemini(json_schema)
+
+        config = genai_types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=4096,
+            response_mime_type="application/json",
+            response_schema=gemini_schema,
+        )
+
+        target_model = (model_override or self.model).value
+
+        for attempt in range(self.max_retries):
+            try:
+                async with self._semaphore:
+                    response = await asyncio.to_thread(
+                        self._client.models.generate_content,
+                        model=target_model,
+                        contents=full_prompt,
+                        config=config,
+                    )
+
+                json_data = json.loads(response.text)
+                return output_schema.model_validate(json_data)
+
+            except Exception as e:
+                if self._is_daily_quota_error(e):
+                    raise RuntimeError(
+                        "Gemini API daily quota exhausted (free tier: 20 requests/day). "
+                        "Wait until tomorrow or upgrade to a paid plan at https://ai.google.dev/pricing"
+                    ) from e
+                if attempt < self.max_retries - 1:
+                    delay = self._get_retry_delay(e, attempt)
+                    logger.warning(
+                        "Structured-native call failed (attempt %d/%d): %s — retrying in %.0fs",
+                        attempt + 1, self.max_retries, str(e)[:120], delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    # Final fallback: try prompt-injection method
+                    logger.warning(
+                        "Native structured output failed after %d attempts, "
+                        "falling back to prompt-injection method",
+                        self.max_retries,
+                    )
+                    return await self.generate_structured(
+                        prompt=prompt,
+                        output_schema=output_schema,
+                        system_prompt=system_prompt,
+                    )
+
     async def generate_with_tools(
         self,
         prompt: str,
@@ -275,12 +383,13 @@ Respond ONLY with the JSON, no other text."""
 
         for attempt in range(self.max_retries):
             try:
-                response = await asyncio.to_thread(
-                    self._client.models.generate_content,
-                    model=self.model.value,
-                    contents=full_prompt,
-                    config=config,
-                )
+                async with self._semaphore:
+                    response = await asyncio.to_thread(
+                        self._client.models.generate_content,
+                        model=self.model.value,
+                        contents=full_prompt,
+                        config=config,
+                    )
 
                 latency = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
 
@@ -332,8 +441,16 @@ Respond ONLY with the JSON, no other text."""
         Convert a JSON Schema dict to the subset accepted by
         ``google.generativeai.protos.Schema``.
 
-        Gemini expects ``type_`` (as enum string) and ``properties``
-        but does *not* accept ``additionalProperties``, ``$defs``, etc.
+        Gemini expects ``type`` (as enum string like "STRING") and
+        ``properties`` but does *not* accept ``additionalProperties``,
+        ``$defs``, ``$ref``, ``anyOf``, ``title``, etc.
+
+        This converter handles:
+        - ``$defs`` / ``$ref`` resolution (Pydantic v2 puts enums and
+          nested models in ``$defs`` and uses ``$ref`` pointers)
+        - ``anyOf`` for ``Optional[T]`` (Pydantic v2 emits
+          ``anyOf: [{type: T}, {type: null}]``)
+        - Nested objects / arrays / enums
         """
         TYPE_MAP = {
             "string": "STRING",
@@ -344,7 +461,45 @@ Respond ONLY with the JSON, no other text."""
             "object": "OBJECT",
         }
 
+        # Top-level $defs dict for resolving $ref pointers
+        defs: dict[str, Any] = schema.get("$defs", {})
+
+        def _resolve_ref(node: dict[str, Any]) -> dict[str, Any]:
+            """Resolve ``$ref`` pointers like ``#/$defs/SupportType``."""
+            ref = node.get("$ref", "")
+            if ref.startswith("#/$defs/"):
+                def_name = ref[len("#/$defs/"):]
+                resolved = defs.get(def_name, {})
+                # Merge any sibling keys (e.g. 'description') from the
+                # referencing node into the resolved definition.
+                merged = {**resolved}
+                for k, v in node.items():
+                    if k != "$ref":
+                        merged[k] = v
+                return merged
+            return node
+
         def _convert(node: dict[str, Any]) -> dict[str, Any]:
+            # Resolve $ref first
+            node = _resolve_ref(node)
+
+            # Handle anyOf (Pydantic v2 Optional[T] pattern)
+            if "anyOf" in node:
+                non_null = [
+                    branch for branch in node["anyOf"]
+                    if branch.get("type") != "null"
+                ]
+                if non_null:
+                    # Use the first non-null branch as the actual type
+                    base = _convert(non_null[0])
+                else:
+                    base = {"type": "STRING"}
+                # Carry over description from the parent node
+                if "description" in node and "description" not in base:
+                    base["description"] = node["description"]
+                base["nullable"] = True
+                return base
+
             result: dict[str, Any] = {}
             json_type = node.get("type", "string")
             result["type"] = TYPE_MAP.get(json_type, "STRING")

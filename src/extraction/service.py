@@ -25,8 +25,10 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import langextract as lx
+from pydantic import BaseModel, Field
 
 from src.config import get_settings
+from src.utils.text import canonicalize_var_id
 
 _logger = logging.getLogger(__name__)
 
@@ -77,6 +79,95 @@ class ExtractedRecommendation:
     risks: list[str] = field(default_factory=list)
     extraction_text: str = ""
     grounded_evidence_keys: list[str] = field(default_factory=list)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Pydantic schemas for LLM canonicalization (structured output)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class CanonicalVariable(BaseModel):
+    """One consolidated variable produced by the canonicalization LLM."""
+
+    canonical_name: str = Field(
+        ...,
+        description=(
+            "The single best name for this concept — short, precise, "
+            "and general enough to cover all merged source names."
+        ),
+    )
+    description: str = Field(
+        ...,
+        description="One-sentence factual definition of this variable.",
+    )
+    var_type: str = Field(
+        ...,
+        description="One of: continuous, discrete, binary, categorical.",
+    )
+    measurement_status: str = Field(
+        ...,
+        description="One of: measured, observable, latent.",
+    )
+    merged_from: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Original variable names that were merged into this one. "
+            "Include ALL source names, even if there is only one."
+        ),
+    )
+    merge_reasoning: str = Field(
+        default="",
+        description="Brief explanation of why these names are the same concept.",
+    )
+
+
+class CanonicalVariableList(BaseModel):
+    """Top-level response schema for the variable canonicalization call."""
+
+    variables: list[CanonicalVariable] = Field(
+        ...,
+        description=(
+            "The deduplicated list of causal variables.  Semantic "
+            "duplicates must be merged into a single entry."
+        ),
+    )
+
+
+class SynthesizedMechanism(BaseModel):
+    """Structured output for LLM-synthesized causal mechanism text.
+
+    Forces the LLM to separate its own reasoning from the verbatim
+    evidence, eliminating the copy-paste anti-pattern where raw
+    evidence snippets were dumped directly into the mechanism field.
+    """
+
+    rationale_in_own_words: str = Field(
+        ...,
+        description=(
+            "Explain HOW the cause variable produces the effect in 1–2 "
+            "sentences using YOUR OWN words.  Describe the causal "
+            "pathway or mechanism — not what the document says, but "
+            "what is actually happening in the real world.  NEVER "
+            "copy-paste text from the evidence."
+        ),
+    )
+    exact_quote: str = Field(
+        ...,
+        description=(
+            "The single most relevant sentence (or clause) from the "
+            "evidence that best supports this causal link.  Copy it "
+            "EXACTLY as written — do not paraphrase, truncate, or "
+            "edit.  If no suitable quote exists, write 'N/A'."
+        ),
+    )
+    source_citation: str = Field(
+        default="",
+        description=(
+            "Document title and section from which the exact_quote "
+            "was taken (e.g. 'Business_Plan.pdf, Section 3.2').  "
+            "Leave empty if the quote is 'N/A'."
+        ),
+    )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -374,12 +465,9 @@ class ExtractionService:
         Keeps the *first* occurrence (which tends to have the best
         description) and merges evidence keys from duplicates.
         """
-        import re
-
         seen: dict[str, ExtractedVariable] = {}
         for var in variables:
-            # Canonical key: lowercase, strip non-alphanum, collapse runs
-            canon = re.sub(r"[^a-z0-9]+", "_", var.name.lower()).strip("_")
+            canon = canonicalize_var_id(var.name)
             if canon in seen:
                 # Merge grounded evidence keys
                 existing = seen[canon]
@@ -481,7 +569,9 @@ class ExtractionService:
         variable_names : list[str]
             Human-readable names (same order as *variable_ids*).
         evidence_map : dict[str, str] | None
-            For citation validation.
+            Deprecated — citation validation is now handled by the
+            verification loop.  Accepted for backward compatibility
+            but ignored.
         dynamic_examples : list | None
             Caller-generated few-shot examples using the actual variable
             IDs.  Falls back to a generic example if ``None``.
@@ -489,7 +579,7 @@ class ExtractionService:
         Returns
         -------
         list[ExtractedEdge]
-            Citation-validated edge list.
+            Edge list with mechanism + strength (no evidence grounding).
         """
         allowed_vars_str = ", ".join(variable_ids)
         prompt = _EDGE_PROMPT_TEMPLATE.format(allowed_vars=allowed_vars_str)
@@ -535,12 +625,8 @@ class ExtractionService:
                 continue
             seen_pairs.add(pair)
 
-            # Citation validation
-            grounded: list[str] = []
-            if evidence_map:
-                grounded = self._validate_citation(
-                    ext.extraction_text, evidence_map
-                )
+            # Note: citation validation removed — edges start as
+            # "draft" and are grounded by the verification loop.
 
             edges.append(ExtractedEdge(
                 from_var=from_var,
@@ -549,7 +635,7 @@ class ExtractionService:
                 strength=(attrs.get("strength") or "hypothesis").lower(),
                 chain_of_thought=attrs.get("chain_of_thought", ""),
                 extraction_text=ext.extraction_text,
-                grounded_evidence_keys=grounded,
+                grounded_evidence_keys=[],
             ))
 
         _logger.info(

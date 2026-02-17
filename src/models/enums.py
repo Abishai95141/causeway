@@ -27,6 +27,13 @@ class ModelStatus(str, Enum):
     DEPRECATED = "deprecated"
 
 
+class EdgeStatus(str, Enum):
+    """Verification status of a causal edge."""
+    DRAFT = "draft"          # Initial extraction, not yet verified
+    GROUNDED = "grounded"    # Passed verification judge
+    REJECTED = "rejected"    # Failed verification (soft-pruned)
+
+
 class RetrievalMethod(str, Enum):
     """Method used to retrieve evidence."""
     PAGEINDEX = "pageindex"

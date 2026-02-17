@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from enum import Enum
 
+from src.utils.text import truncate_at_sentence_boundary
+
 
 class MessageRole(str, Enum):
     """Message roles in conversation."""
@@ -228,11 +230,35 @@ class ContextManager:
         return len(text) // 4
     
     def _trim_context(self) -> None:
-        """Trim older messages to fit within budget."""
+        """Trim older messages to fit within budget.
+
+        Instead of blindly deleting messages (which destroys evidence
+        the LLM may need later), we:
+        1. Preserve the system prompt and last user+assistant exchange.
+        2. Compress older TOOL messages by summarising their content
+           at sentence boundaries rather than dropping them entirely.
+        3. Only fully remove messages as a last resort.
+        """
         target_tokens = int(self.max_tokens * 0.6)  # Trim to 60% capacity
-        
-        while self.used_tokens > target_tokens and len(self._messages) > 2:
-            # Keep at least the last exchange
+
+        # Phase 1: Compress older tool messages (keep last 2 messages intact)
+        safe_tail = 2  # always preserve the most recent exchange
+        i = 0
+        while self.used_tokens > target_tokens and i < len(self._messages) - safe_tail:
+            msg = self._messages[i]
+            if msg.role == MessageRole.TOOL and len(msg.content) > 300:
+                # Summarise rather than destroy
+                compressed = truncate_at_sentence_boundary(
+                    msg.content, max_chars=300, suffix=" [trimmed]",
+                )
+                saved_tokens = msg.token_estimate - self._estimate_tokens(compressed)
+                if saved_tokens > 0:
+                    msg.content = compressed
+                    msg.token_estimate = self._estimate_tokens(compressed)
+            i += 1
+
+        # Phase 2: If still over budget, remove oldest non-essential messages
+        while self.used_tokens > target_tokens and len(self._messages) > safe_tail:
             removed = self._messages.pop(0)
     
     def clear(self) -> None:

@@ -19,6 +19,7 @@ from src.agent.context_manager import ContextManager, MessageRole
 from src.retrieval.router import RetrievalRouter, RetrievalRequest
 from src.causal.service import CausalService
 from src.training.spans import SpanCollector, SpanStatus
+from src.utils.text import truncate_evidence, truncate_for_context_tracking
 
 
 @dataclass
@@ -69,6 +70,14 @@ class AgentOrchestrator:
         self.causal = causal_service or CausalService()
         self.spans = span_collector or SpanCollector(enabled=True)
         self.max_tool_calls = max_tool_calls
+
+        # Lazy import to avoid circular: orchestrator → verification → judge → llm_client → agent.__init__ → orchestrator
+        from src.verification.loop import VerificationAgent
+        self.verifier = VerificationAgent(
+            llm_client=self.llm,
+            retrieval_router=self.retrieval,
+            span_collector=self.spans,
+        )
         
         self._context = ContextManager()
         self._tools = self._register_default_tools()
@@ -318,6 +327,32 @@ class AgentOrchestrator:
                     "required": ["cause", "effect"],
                 },
             ),
+            ToolDefinition(
+                name="verify_edge",
+                description=(
+                    "Verify whether a proposed causal edge is grounded in evidence. "
+                    "Runs a multi-turn retrieve-judge loop that checks if the "
+                    "evidence corpus explicitly supports the causal claim."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "cause": {
+                            "type": "string",
+                            "description": "The cause variable ID or name",
+                        },
+                        "effect": {
+                            "type": "string",
+                            "description": "The effect variable ID or name",
+                        },
+                        "mechanism": {
+                            "type": "string",
+                            "description": "Description of the causal mechanism",
+                        },
+                    },
+                    "required": ["cause", "effect"],
+                },
+            ),
         ]
     
     def _setup_tool_handlers(self) -> None:
@@ -327,6 +362,7 @@ class AgentOrchestrator:
             "analyze_causal_path": self._handle_analyze_causal_path,
             "get_model_summary": self._handle_get_model_summary,
             "find_confounders": self._handle_find_confounders,
+            "verify_edge": self._handle_verify_edge,
         }
     
     async def _handle_search_evidence(
@@ -340,7 +376,7 @@ class AgentOrchestrator:
         results = []
         for bundle in bundles:
             results.append({
-                "content": bundle.content[:500],  # Truncate for context
+                "content": truncate_evidence(bundle.content, max_chars=800),
                 "source": bundle.source.doc_title,
                 "location": {
                     "page": bundle.location.page_number,
@@ -351,7 +387,7 @@ class AgentOrchestrator:
             # Track evidence in context
             self._context.add_evidence(
                 bundle.content_hash[:8],
-                bundle.content[:100] + "...",
+                truncate_for_context_tracking(bundle.content, max_chars=200),
             )
         
         return {"results": results, "count": len(results)}
@@ -402,6 +438,39 @@ class AgentOrchestrator:
                 "count": len(confounders),
             }
         except ValueError as e:
+            return {"error": str(e)}
+
+    async def _handle_verify_edge(
+        self,
+        cause: str,
+        effect: str,
+        mechanism: str = "",
+    ) -> dict[str, Any]:
+        """Handle verify_edge tool call — runs the agentic verification loop."""
+        try:
+            result = await self.verifier.verify_edge(
+                from_var=cause,
+                to_var=effect,
+                mechanism=mechanism,
+            )
+            response: dict[str, Any] = {
+                "cause": cause,
+                "effect": effect,
+                "grounded": result.grounded,
+                "edge_status": result.edge_status.value,
+                "confidence": result.confidence,
+                "iterations_used": result.iterations_used,
+            }
+            if result.supporting_quote:
+                response["supporting_quote"] = result.supporting_quote
+            if result.rejection_reason:
+                response["rejection_reason"] = result.rejection_reason
+            if result.alternative_explanations:
+                response["alternative_explanations"] = result.alternative_explanations
+            if result.assumptions:
+                response["assumptions"] = result.assumptions
+            return response
+        except Exception as e:
             return {"error": str(e)}
     
     def register_tool(
