@@ -99,3 +99,4 @@ frontend/ui/.turbo/
 # Accidental files
 -d
 -H
+.env
