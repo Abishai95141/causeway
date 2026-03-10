@@ -179,6 +179,13 @@ class Mode2Request(BaseModel):
     domain_hint: Optional[str] = Field(default=None, description="Optional domain hint")
 
 
+class CausalPathDTO(BaseModel):
+    """A traced causal path."""
+    path: list[str] = []
+    mechanism_chain: str = ""
+    strength: str = ""
+
+
 class Mode2Response(BaseModel):
     """Response from Mode 2 execution."""
     trace_id: str
@@ -191,6 +198,13 @@ class Mode2Response(BaseModel):
     escalate_to_mode1: bool = False
     escalation_reason: Optional[str] = None
     error: Optional[str] = None
+    # Rich audit / trace fields
+    expected_outcome: Optional[str] = None
+    reasoning_trace: Optional[str] = None
+    causal_paths: list[CausalPathDTO] = []
+    risks: list[str] = []
+    suggested_actions: list[str] = []
+    audit_log: list[dict] = []
 
 
 class WorldModelSummary(BaseModel):
@@ -692,10 +706,34 @@ async def run_mode2(request: Mode2Request):
     
     recommendation_text = None
     confidence_text = None
+    expected_outcome = None
+    reasoning_trace = None
+    causal_paths_dto: list[CausalPathDTO] = []
+    risks: list[str] = []
+    suggested_actions: list[str] = []
     
     if result.recommendation:
         recommendation_text = result.recommendation.recommendation
         confidence_text = result.recommendation.confidence.value
+        expected_outcome = result.recommendation.expected_outcome
+        reasoning_trace = result.recommendation.reasoning_trace
+        risks = result.recommendation.risks or []
+        suggested_actions = result.recommendation.suggested_actions or []
+        for cp in (result.recommendation.causal_paths or []):
+            causal_paths_dto.append(CausalPathDTO(
+                path=cp.path,
+                mechanism_chain=cp.mechanism_chain,
+                strength=cp.strength,
+            ))
+
+    # Build audit log from internal audit entries
+    audit_log = []
+    for entry in (result.audit_entries or []):
+        audit_log.append({
+            "action": entry.action,
+            "data": entry.data,
+            "timestamp": entry.timestamp.isoformat() if hasattr(entry.timestamp, 'isoformat') else str(entry.timestamp),
+        })
     
     return Mode2Response(
         trace_id=result.trace_id,
@@ -708,6 +746,12 @@ async def run_mode2(request: Mode2Request):
         escalate_to_mode1=result.escalate_to_mode1,
         escalation_reason=result.escalation_reason,
         error=result.error,
+        expected_outcome=expected_outcome,
+        reasoning_trace=reasoning_trace,
+        causal_paths=causal_paths_dto,
+        risks=risks,
+        suggested_actions=suggested_actions,
+        audit_log=audit_log,
     )
 
 

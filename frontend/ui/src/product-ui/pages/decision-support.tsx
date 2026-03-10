@@ -189,13 +189,26 @@ export function DecisionSupportPage() {
   );
 }
 
+/* ─── Confidence helpers ─── */
+const CONF_META: Record<string, { label: string; pct: number; variant: "success" | "warning" | "error" }> = {
+  high:   { label: "High",   pct: 90, variant: "success" },
+  medium: { label: "Medium", pct: 60, variant: "warning" },
+  low:    { label: "Low",    pct: 30, variant: "error" },
+};
+
 /* ─── Recommendation Card ─── */
 function RecommendationCard({ data }: { data: Mode2ResponseDTO }) {
   const [expanded, setExpanded] = useState(false);
-  const confNum = data.confidence ? parseFloat(data.confidence) : 0;
+  const conf = data.confidence ? CONF_META[data.confidence.toLowerCase()] ?? null : null;
+  const paths = data.causal_paths ?? [];
+  const risks = data.risks ?? [];
+  const actions = data.suggested_actions ?? [];
+  const auditLog = data.audit_log ?? [];
+
   return (
     <Card className="border-[var(--color-accent-500)]/15 shadow-[var(--shadow-lg)]">
       <CardContent className="p-6 space-y-4">
+        {/* ── Header: icon + recommendation + confidence ── */}
         <div className="flex items-start gap-4">
           <div className="flex items-center justify-center w-10 h-10 rounded-2xl bg-[var(--color-accent-500)]/10 shrink-0">
             <Sparkles className="w-5 h-5 text-[var(--color-accent-500)]" />
@@ -203,9 +216,9 @@ function RecommendationCard({ data }: { data: Mode2ResponseDTO }) {
           <div className="flex-1">
             <div className="flex items-center gap-2 mb-2">
               <p className="text-[11px] font-bold text-[var(--text-secondary)] uppercase tracking-widest">Recommendation</p>
-              {data.confidence && (
-                <Badge variant={confNum >= 0.7 ? "success" : confNum >= 0.4 ? "warning" : "error"}>
-                  {(confNum * 100).toFixed(0)}% confidence
+              {conf && (
+                <Badge variant={conf.variant}>
+                  {conf.label} confidence
                 </Badge>
               )}
             </div>
@@ -213,6 +226,15 @@ function RecommendationCard({ data }: { data: Mode2ResponseDTO }) {
           </div>
         </div>
 
+        {/* ── Expected Outcome (always visible when present) ── */}
+        {data.expected_outcome && (
+          <div className="ml-14 p-3 rounded-xl bg-[var(--bg-tertiary)] border border-[var(--border-primary)]">
+            <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-widest mb-1">Expected Outcome</p>
+            <p className="text-[13px] text-[var(--text-secondary)] leading-relaxed">{data.expected_outcome}</p>
+          </div>
+        )}
+
+        {/* ── Show details toggle ── */}
         <button onClick={() => setExpanded(!expanded)} className="flex items-center gap-1.5 text-[12px] text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors font-medium">
           {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
           {expanded ? "Show less" : "Show details"}
@@ -220,13 +242,104 @@ function RecommendationCard({ data }: { data: Mode2ResponseDTO }) {
 
         <AnimatePresence>
           {expanded && (
-            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="space-y-4 overflow-hidden">
+            <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="space-y-5 overflow-hidden">
+
+              {/* ── Metadata grid ── */}
               <div className="grid grid-cols-2 gap-4 text-[13px]">
                 {data.stage && <div><span className="font-semibold text-[var(--text-tertiary)]">Stage:</span> <span className="text-[var(--text-secondary)]">{data.stage}</span></div>}
                 {data.model_used && <div><span className="font-semibold text-[var(--text-tertiary)]">Model:</span> <span className="text-[var(--text-secondary)]">{data.model_used}</span></div>}
                 <div><span className="font-semibold text-[var(--text-tertiary)]">Evidence:</span> <span className="text-[var(--text-secondary)]">{data.evidence_count} items</span></div>
                 <div><span className="font-semibold text-[var(--text-tertiary)]">Trace ID:</span> <span className="text-[var(--text-secondary)] font-mono text-[11px]">{data.trace_id}</span></div>
               </div>
+
+              {/* ── Causal Paths ── */}
+              {paths.length > 0 && (
+                <div>
+                  <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-widest mb-2">Causal Paths Traced</p>
+                  <div className="space-y-2">
+                    {paths.map((cp, i) => (
+                      <div key={i} className="p-3 rounded-xl bg-[var(--bg-tertiary)] border border-[var(--border-primary)]">
+                        <div className="flex items-center gap-1.5 mb-1.5 flex-wrap">
+                          {cp.path.map((node, j) => (
+                            <span key={j} className="flex items-center gap-1.5">
+                              <span className="px-2 py-0.5 rounded-md bg-[var(--color-accent-500)]/10 text-[var(--color-accent-500)] text-[11px] font-semibold">
+                                {node.replace(/_/g, " ")}
+                              </span>
+                              {j < cp.path.length - 1 && <ChevronRight className="w-3 h-3 text-[var(--text-tertiary)]" />}
+                            </span>
+                          ))}
+                          <Badge variant={cp.strength === "strong" ? "success" : cp.strength === "moderate" ? "warning" : "error"} className="ml-auto text-[10px]">{cp.strength}</Badge>
+                        </div>
+                        <p className="text-[12px] text-[var(--text-secondary)] leading-relaxed">{cp.mechanism_chain}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Reasoning Trace ── */}
+              {data.reasoning_trace && (
+                <div>
+                  <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-widest mb-2">Reasoning Trace</p>
+                  <div className="p-3 rounded-xl bg-[var(--bg-tertiary)] border border-[var(--border-primary)]">
+                    <p className="text-[12px] text-[var(--text-secondary)] leading-relaxed whitespace-pre-wrap">{data.reasoning_trace}</p>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Risks ── */}
+              {risks.length > 0 && (
+                <div>
+                  <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-widest mb-2">Risks Identified</p>
+                  <ul className="space-y-1">
+                    {risks.map((r, i) => (
+                      <li key={i} className="flex items-start gap-2 text-[12px] text-[var(--text-secondary)]">
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+                        {r}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* ── Suggested Actions ── */}
+              {actions.length > 0 && (
+                <div>
+                  <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-widest mb-2">Suggested Actions</p>
+                  <ul className="space-y-1">
+                    {actions.map((a, i) => (
+                      <li key={i} className="flex items-start gap-2 text-[12px] text-[var(--text-secondary)]">
+                        <ChevronRight className="w-3.5 h-3.5 text-[var(--color-accent-500)] shrink-0 mt-0.5" />
+                        {a}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* ── Audit Log ── */}
+              {auditLog.length > 0 && (
+                <div>
+                  <p className="text-[11px] font-bold text-[var(--text-tertiary)] uppercase tracking-widest mb-2">Audit Trail</p>
+                  <div className="space-y-1.5">
+                    {auditLog.map((entry, i) => (
+                      <div key={i} className="flex items-start gap-3 text-[11px]">
+                        <div className="w-1.5 h-1.5 rounded-full bg-[var(--color-accent-500)] shrink-0 mt-1.5" />
+                        <div className="flex-1">
+                          <span className="font-semibold text-[var(--text-secondary)]">{entry.action}</span>
+                          {entry.data && Object.keys(entry.data).length > 0 && (
+                            <span className="text-[var(--text-tertiary)] ml-2">
+                              {Object.entries(entry.data).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`).join(" · ")}
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-[var(--text-tertiary)] font-mono shrink-0">{new Date(entry.timestamp).toLocaleTimeString()}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
             </motion.div>
           )}
         </AnimatePresence>

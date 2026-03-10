@@ -230,6 +230,7 @@ class Mode2DecisionSupport:
                     audit_entries=audit_entries,
                     escalate_to_mode1=True,
                     escalation_reason="Insufficient evidence found. Consider gathering more documents via Mode 1.",
+                    evidence_count=len(evidence),
                 )
             
             audit_entries.append(self._create_audit(
@@ -261,6 +262,7 @@ class Mode2DecisionSupport:
                         f"Critical conflicts detected ({critical_conflicts} critical, "
                         f"{conflicts_detected} total). World model rebuild recommended."
                     ),
+                    evidence_count=len(evidence),
                     conflicts_detected=conflicts_detected,
                     critical_conflicts=critical_conflicts,
                     conflict_details=conflict_details,

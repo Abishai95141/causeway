@@ -1224,21 +1224,53 @@ class Mode1WorldModelConstruction:
         approved_by: str,
     ) -> WorldModelVersion:
         """Approve and activate a world model, persisting to PostgreSQL."""
-        engine = self.causal.get_engine(domain)
+        # Load from DB if engine not in memory (e.g. after server restart)
+        try:
+            engine = self.causal.get_engine(domain)
+        except ValueError:
+            logging.getLogger(__name__).info(
+                "Engine for '%s' not in memory – loading from DB for approval", domain
+            )
+            engine = await self.causal.load_from_db(domain)
+
         model = engine.to_world_model(domain, f"World model for {domain}")
-        
+
         model.status = ModelStatus.ACTIVE
         model.approved_by = approved_by
         model.approved_at = datetime.now(timezone.utc)
-        
-        # Persist to PostgreSQL
+
+        # Update existing DB row status instead of creating a duplicate
         try:
-            await self.causal.save_to_db(domain=domain, version_id=model.version_id)
+            from src.storage.database import get_db_session, WorldModelVersionDB
+            from sqlalchemy import select
+
+            async with get_db_session() as session:
+                # Find the most recent version for this domain
+                result = await session.execute(
+                    select(WorldModelVersionDB)
+                    .where(WorldModelVersionDB.domain == domain)
+                    .order_by(WorldModelVersionDB.created_at.desc())
+                )
+                wm_row = result.scalars().first()
+
+                if wm_row:
+                    wm_row.status = "active"
+                    wm_row.approved_by = approved_by
+                    wm_row.approved_at = model.approved_at
+                    wm_row.updated_at = datetime.now(timezone.utc)
+                    await session.flush()
+                    logging.getLogger(__name__).info(
+                        "World model approved in DB: domain=%s version=%s",
+                        domain, wm_row.version_id,
+                    )
+                else:
+                    # No existing row — fall back to full save
+                    await self.causal.save_to_db(domain=domain, version_id=model.version_id)
         except Exception as exc:
             logging.getLogger(__name__).warning("DB save on approve failed: %s", exc)
-        
+
         self._current_stage = Mode1Stage.COMPLETE
-        
+
         return model
     
     @property

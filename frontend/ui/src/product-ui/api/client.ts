@@ -238,6 +238,13 @@ export interface Mode2ResponseDTO {
   escalate_to_mode1: boolean;
   escalation_reason?: string;
   error?: string;
+  // Rich audit / trace fields
+  expected_outcome?: string;
+  reasoning_trace?: string;
+  causal_paths?: { path: string[]; mechanism_chain: string; strength: string }[];
+  risks?: string[];
+  suggested_actions?: string[];
+  audit_log?: { action: string; data: Record<string, unknown>; timestamp: string }[];
 }
 
 /** GET /api/v1/world-models → WorldModelSummary[] */
